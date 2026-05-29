@@ -1,20 +1,24 @@
 # 📋 BlueprintBuster — 未支持节点类型完整清单
 
 > 本文档详细列举了BlueprintBuster目前**未支持**的Blueprint节点类型，分析其使用场景、转换难度、以及完整的实现方案。
+> 
+> 💡 **核心内容整合：** 包含从第一问题、第二问题和第三问题的所有TODO分析和实现方案
 
-**文档版本：** 1.1  
+**文档版本：** 1.2  
 **最后更新：** 2026-05-29  
-**覆盖范围：** UE5.7+ 所有常用K2Node节点类型
+**覆盖范围：** UE5.7+ 所有常用K2Node节点类型 + 系统级TODO
 
 ---
 
 ## 目录
 
 1. [快速概览](#快速概览)
-2. [完全未支持的节点](#完全未支持的节点)
-3. [部分支持的节点](#部分支持的节点)
-4. [实现优先级](#实现优先级)
-5. [详细实现方案](#详细实现方案)
+2. [系统级TODO（第一问题整合）](#系统级todo第一问题整合)
+3. [README表格级TODO（第二问题整合）](#readme表格级todo第二问题整合)
+4. [完全未支持的节点](#完全未支持的节点)
+5. [部分支持的节点](#部分支持的节点)
+6. [实现优先级](#实现优先级)
+7. [详细实现方案](#详细实现方案)
 
 ---
 
@@ -29,6 +33,344 @@
 | ❌ 完全未支持 | **28+** | 0% |
 | **总计** | **38+** | **~30%** |
 
+### 待处理TODO统计
+
+| 类别 | 数量 | 优先级 | 预计工时 |
+|------|------|--------|---------|
+| 系统级TODO | 4 | 🔴 高 | 9-15天 |
+| 表格级TODO | 4 | 🔴 高 | 8-12天 |
+| 节点支持TODO | 28+ | 🟡 中 | 90天 |
+
+---
+
+## 系统级TODO（第一问题整合）
+
+> 这些是出现在代码深处的核心功能缺陷，影响整体架构
+
+### 🏆 **TODO-1：TMap 类型系统不完整** ⭐⭐⭐⭐⭐
+
+**问题根源：** Blueprint的Map类型只记录值类型，不记录键类型
+
+**现状：**
+- JSON导出：只有 `valueType`，缺少 `keyType`
+- Python生成：默认所有Map为 `TMap<FName, ValueType>`
+- 生成代码：`TMap<FName, FString>  // MANUAL: replace with actual types`
+
+**影响范围：** ⭐⭐⭐⭐ 非常高
+- 所有使用Map的Blueprint无法100%自动化
+- Code Review中需要逐个手工修改
+
+**文件位置：**
+- C++导出：`Source/BlueprintBuster/Private/BlueprintBusterParsers.cpp` line ~134
+- Python生成：`Python/bp_translator.py` line 342, 390
+- README：line 131
+
+**完整解决方案：**
+
+**第一步：扩展C++侧JSON导出**
+
+修改文件：`Source/BlueprintBuster/Private/BlueprintBusterParsers.cpp`
+
+在 `ExportPropertyValue()` 函数中添加：
+
+```cpp
+// 在第134-186行的ExportPropertyValue()中添加
+if (const FMapProperty* MapProp = CastField<FMapProperty>(InProperty))
+{
+    const FProperty* KeyProp = MapProp->KeyProp;
+    const FProperty* ValProp = MapProp->ValueProp;
+    
+    OutPointerHint = TEXT("Map");
+    
+    // 关键改进：导出键值类型信息
+    FString KeyTypeName = KeyProp ? KeyProp->GetClass()->GetName() : TEXT("FNameProperty");
+    FString ValTypeName = ValProp ? ValProp->GetClass()->GetName() : TEXT("StrProperty");
+    
+    // 返回格式：KEY_TYPE|VALUE_TYPE|value
+    return FString::Printf(TEXT("%s|%s"), *KeyTypeName, *ValTypeName);
+}
+```
+
+**第二步：修改JSON序列化**
+
+在 `Source/BlueprintBuster/Private/BlueprintBusterCommandlet.cpp` 中找到属性序列化代码，添加：
+
+```cpp
+if (prop.PropertyTypeName == TEXT("MapProperty"))
+{
+    PropertyJson->SetStringField(TEXT("mapKeyType"), ExtractKeyType(prop));
+    PropertyJson->SetStringField(TEXT("mapValueType"), ExtractValueType(prop));
+}
+```
+
+**第三步：修改Python解析**
+
+`Python/bp_translator.py` 中修改：
+
+```python
+@dataclass
+class PropertyInfo:
+    # ... existing fields ...
+    map_key_type: str = ""       # NEW
+    map_value_type: str = ""     # NEW
+
+def cpp_type_for_property(prop: PropertyInfo) -> str:
+    """Resolves the C++ declaration type for a given dumped property."""
+    pt = prop.property_type
+    
+    if pt == "MapProperty":
+        TYPE_MAP = {
+            "BoolProperty": "bool",
+            "IntProperty": "int32",
+            "Int64Property": "int64",
+            "NameProperty": "FName",
+            "StrProperty": "FString",
+            "FloatProperty": "float",
+            "DoubleProperty": "double",
+        }
+        
+        key_cpp = TYPE_MAP.get(prop.map_key_type, "FName")
+        val_cpp = TYPE_MAP.get(prop.map_value_type, "FString")
+        
+        return f"TMap<{key_cpp}, {val_cpp}>"
+    
+    # ... rest of function ...
+```
+
+**预期效果：**
+
+| 前 | 后 |
+|----|----|
+| `TMap<FName, FString>  // TODO` | `TMap<int32, FString>  // ✅ 自动` |
+| `TMap<FName, bool>  // TODO` | `TMap<FName, bool>  // ✅ 自动` |
+
+**工时估计：** 2-3天  
+**难度：** 🟢 低  
+**优先��：** 🔴 第1位
+
+---
+
+### 🏆 **TODO-2：事件节点映射不完整（BeginPlay/Tick等）** ⭐⭐⭐⭐
+
+**问题根源：** ReceiveBeginPlay、ReceiveTick、ReceiveEndPlay无法自动映射到C++方法
+
+**现状：**
+- 这些事件在代码中返回 `None`
+- BP事件图的执行逻辑完全被忽略
+- 生成的类只有空骨架
+
+**影响范围：** ⭐⭐⭐⭐ 非常高
+- 90%的Blueprint使用ReceiveBeginPlay作为初始化逻辑
+- 所有基于事件的Blueprint转换失败
+
+**文件位置：**
+- Python处理：`Python/bp_translator.py` line 703-711
+- 生成逻辑：line 828-842
+
+**完整解决方案：**
+
+修改 `Python/bp_translator.py`：
+
+```python
+def _event_to_cpp_name(event_label: str) -> Optional[str]:
+    """Maps BP event names to their C++ override names. FIXED VERSION."""
+    EVENT_MAP = {
+        "ReceiveBeginPlay": "BeginPlay",         # ✅ FIXED
+        "ReceiveTick": "Tick",                   # ✅ FIXED
+        "ReceiveEndPlay": "EndPlay",             # ✅ FIXED
+        "ReceiveAnyDamage": "OnAnyDamage",
+        "ReceiveActorBeginOverlap": "OnActorBeginOverlap",
+        "ReceiveActorEndOverlap": "OnActorEndOverlap",
+        "ReceiveActorHit": "OnActorHit",
+    }
+    return EVENT_MAP.get(event_label, event_label if event_label not in ("ReceiveBeginPlay", "ReceiveTick", "ReceiveEndPlay") else None)
+```
+
+修改 `emit_header()` 中的事件处理（line 676-697）：
+
+```python
+def emit_header(...) -> str:
+    # ...
+    if dump.is_actor_derived:
+        lines.append("    virtual void BeginPlay() override;")
+        if has_tick:
+            lines.append("    virtual void Tick(float DeltaSeconds) override;")
+```
+
+修改 `emit_source()` 中的事件生成（line 806-841）：
+
+```python
+def emit_source(...) -> str:
+    # ...
+    if dump.is_actor_derived:
+        lines += [
+            f"void {class_name}::BeginPlay()",
+            "{",
+            "    Super::BeginPlay();",
+        ]
+        bp_tree = _find_event_tree(dump, "ReceiveBeginPlay")
+        if bp_tree:
+            lines += _emit_node_chain(bp_tree, indent=1)
+        else:
+            lines.append("    // TODO: BP event ReceiveBeginPlay has no implementation")
+        lines += ["}", ""]
+
+        if has_tick:
+            tick_tree = _find_event_tree(dump, "ReceiveTick")
+            lines += [
+                f"void {class_name}::Tick(float DeltaSeconds)",
+                "{",
+                "    Super::Tick(DeltaSeconds);",
+            ]
+            if tick_tree:
+                lines += _emit_node_chain(tick_tree, indent=1)
+            else:
+                lines.append("    // TODO: BP event ReceiveTick has no implementation")
+            lines += ["}", ""]
+```
+
+**预期效果：**
+
+| 前 | 后 |
+|----|----|
+| 空方法体 | `void BeginPlay() { Super::BeginPlay(); /* BP逻辑 */ }` |
+| 手工补全 | ✅ 完全自动 |
+
+**工时估计：** 2-3天  
+**难度：** 🟢 低  
+**优先级：** 🔴 第2位（最高收益）
+
+---
+
+### 🏆 **TODO-3：UK2Node_CallFunction 参数提取与代码生成** ⭐⭐⭐⭐
+
+**问题根源：** 函数调用节点识别但生成代码仍为TODO，无法提取参数列表
+
+**现状：**
+```cpp
+// Call: MyFunction
+// TODO: implement call to MyFunction on ACharacter.
+```
+
+**应该生成：**
+```cpp
+if (IsValid(TargetObject)) {
+    TargetObject->MyFunction(param1, param2);  // TODO: verify parameters
+}
+```
+
+**完整解决方案：** 见详细实现方案第一部分
+
+**工时估计：** 3-4天  
+**难度：** 🟡 中  
+**优先级：** 🔴 第3位
+
+---
+
+### 🏆 **TODO-4：UK2Node_MacroInstance 宏展开** ⭐⭐⭐⭐
+
+**问题根源：** 宏节点无法递归展开，生成TODO让人工处理
+
+**现状：**
+```cpp
+// TODO: macro 'MyMacro' must be expanded manually.
+```
+
+**完整解决方案：** 见详细实现方案第三部分
+
+**工时估计：** 4-5天  
+**难度：** 🔴 高  
+**优先级：** 🔴 第4位
+
+---
+
+## README表格级TODO（第二问题整合）
+
+> 这些是出现在README文档表格中需要实现的节点功能
+
+### 📋 **README表格1：Supported node types（line 97-104）**
+
+#### 🟡 **TODO-A：UK2Node_CallFunction** — 函数调用
+
+| 属性 | 值 |
+|------|-----|
+| 现状 | TODO stub with function name and target class |
+| 应该 | 生成可工作的函数调用代码 |
+| 完成度 | 60% |
+
+**改进措施：**
+1. 提取函数参数信息
+2. 识别目标对象类型
+3. 生成 `Object->Function(params)` 或 `this->Function(params)` 调用
+4. 处理返回值
+
+**参考方案：** 见 [详细实现方案 - 方案1](#方案1uK2node_callfunction-完整实现)
+
+---
+
+#### 🟡 **TODO-B：UK2Node_MacroInstance** — 宏实例
+
+| 属性 | 值 |
+|------|-----|
+| 现状 | TODO stub with macro name |
+| 应该 | 递归展开宏内容 |
+| 完成度 | 10% |
+
+**改进措施：**
+1. 递归访问宏Graph
+2. 展开Tunnel入口
+3. 参数映射
+4. 防止无限循环
+
+**参考方案：** 见 [详细实现方案 - 方案3](#方案3uK2node_macroinstance-宏展开)
+
+---
+
+#### 🟡 **TODO-C：Any unknown node** — 未知节点
+
+| 属性 | 值 |
+|------|-----|
+| 现状 | TODO stub with node class name |
+| 应该 | 分类显示并提供针对性建议 |
+| 完成度 | 20% |
+
+**改进措施：**
+1. 按节点类型分类统计
+2. 区分"可能支持"vs"完全未知"
+3. 为常见未知节点提供具体TODO提示
+
+**示例对比：**
+
+```cpp
+// ❌ 原来（无区别）
+// TODO: unsupported node 'UK2Node_Timeline' — Node class UK2Node_Timeline, Has 5 pins
+
+// ✅ 改进后（分类提示）
+// ⚠️  UK2Node_Timeline: Animation timeline (requires Timeline data export)
+// TODO: implement Timeline or use FTimerManager instead
+```
+
+---
+
+### 📋 **README表格2：Blueprint Pin Type（line 111-131）**
+
+#### 🟡 **TODO-D：TMap<K,V>** — Map容器
+
+| Blueprint | C++ 当前 | C++ 应该 |
+|-----------|---------|----------|
+| `TMap<K,V>` | `TMap<K,V>  // TODO: confirm key type` | `TMap<int32, FString>` （自动推导） |
+
+**改进措施：** 见 TODO-1 的完整解决方案
+
+**优先级对应关系：**
+
+| README TODO | 系统级TODO | 工时 | 优先级 |
+|------------|-----------|------|--------|
+| TODO-A (CallFunction) | TODO-3 | 3-4天 | 🔴 高 |
+| TODO-B (MacroInstance) | TODO-4 | 4-5天 | 🔴 高 |
+| TODO-C (Unknown nodes) | — | 1-2天 | 🟡 中 |
+| TODO-D (TMap key type) | TODO-1 | 2-3天 | 🔴 高 |
+
 ---
 
 ## 完全未支持的节点
@@ -39,7 +381,7 @@
 - **用途：** 多分支条件判断（类似C++ switch）
 - **使用频率：** ⭐⭐⭐⭐ 很高
 - **生成代码：** TODO
-- **转换难度：** 🟢 低
+- **转换难度：** 🟡 中
 - **预计工时：** 2-3天
 
 **问题：** 需识别switch条件表达式和各分支目标
@@ -66,6 +408,8 @@ switch (DialogueState) {
 }
 ```
 
+**完整实现方案：** 见 [详细实现方案 - 方案4](#方案4uK2node_switch-switch语句)
+
 ---
 
 #### 2. **UK2Node_MultiGate** — Multi-Gate/Flip-Flop
@@ -76,26 +420,6 @@ switch (DialogueState) {
 - **预计工时：** 3-4天
 
 **问题：** 需维护内部状态（当前执行分支索引）
-
-**示例：**
-```blueprint
-MultiGate (Num=3)
-  → Output 0: ...
-  → Output 1: ...
-  → Output 2: ...
-  [每次调用循环到下一个输出]
-```
-
-**目标C++代码：**
-```cpp
-static int32 MultiGateIndex = 0;
-switch (MultiGateIndex % 3) {
-    case 0: /* ... */ break;
-    case 1: /* ... */ break;
-    case 2: /* ... */ break;
-}
-MultiGateIndex++;
-```
 
 ---
 
@@ -108,544 +432,47 @@ MultiGateIndex++;
 
 **问题：** 数据节点，非执行节点；需特殊处理
 
-**示例：**
-```blueprint
-Select
-  Condition: bIsActive
-  True: 100
-  False: 0
-  → Output: int
-```
-
-**目标C++代码：**
-```cpp
-int32 Value = bIsActive ? 100 : 0;
-```
-
 ---
 
-#### 4. **UK2Node_ForLoop** — For Loop
-- **用途：** 循环执行（固定次数）
-- **使用频率：** ⭐⭐⭐⭐ 很高
-- **生成代码：** TODO
-- **转换难度：** 🟡 中
-- **预计工时：** 3-4天
+#### 4-11. 其他数据处理节点
 
-**问题：** 需处理Loop Body、Loop Complete、Index输出
-
-**示例：**
-```blueprint
-ForLoop
-  First Index: 0
-  Last Index: 10
-  → LoopBody (with Index)
-  → LoopComplete
-```
-
-**目标C++代码：**
-```cpp
-for (int32 Index = 0; Index <= 10; ++Index) {
-    // Loop body here
-    // TODO: implement loop logic with Index
-}
-// Loop complete
-```
-
----
-
-#### 5. **UK2Node_ForLoopWithBreak** — For Loop with Break
-- **用途：** 可中断的循环
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** TODO
-- **转换难度：** 🟡 中
-- **预计工时：** 3-4天
-
-**问题：** 需识别Break条件
-
----
-
-#### 6. **UK2Node_WhileLoop** — While Loop
-- **用途：** 条件循环
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** TODO
-- **转换难度：** 🟡 中
-- **预计工时：** 3-4天
-
-**问题：** 需识别循环条件表达式
-
----
-
-#### 7. **UK2Node_DoN** — Do N Times
-- **用途：** 触发N次后执行分支
-- **使用频率：** ⭐⭐ 中等偏低
-- **生成代码：** TODO
-- **转换难度：** 🟡 中
-- **预计工时：** 2-3天
-
-**问题：** 需维护计数器状态
-
----
-
-#### 8. **UK2Node_Timeline** — Timeline
-- **用途：** 动画曲线时间轴
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** TODO
-- **转换难度：** 🔴 高
-- **预计工时：** 7-10天
-
-**问题：** Timeline是完整的子资源（曲线、轨道、时间标记），需深度导出
-
-**替代方案：** 使用 `FTimerManager` 或 `Tween` 库
-
----
-
-#### 9. **UK2Node_Delay** — Delay
-- **用途：** 延迟执行
-- **使用频率：** ⭐⭐⭐⭐ 很高
-- **生成代码：** TODO
-- **转换难度：** 🟢 低
-- **预计工时：** 1-2天
-
-**问题：** 简单替换为 `GetWorld()->GetTimerManager().SetTimer()`
-
-**示例：**
-```blueprint
-Delay (2.0 seconds)
-```
-
-**目标C++代码：**
-```cpp
-GetWorld()->GetTimerManager().SetTimer(
-    DelayHandle,
-    this,
-    &AMyClass::OnDelayComplete,
-    2.0f,
-    false
-);
-```
-
----
-
-#### 10. **UK2Node_SpawnActor** — Spawn Actor
-- **用途：** 运行时生成Actor
-- **使用频率：** ⭐⭐⭐⭐ 很高
-- **生成代码：** 部分TODO
-- **转换难度：** 🟢 低
-- **预计工时：** 1-2天
-
-**问题：** 需识别Actor类、Transform、Owner参数
-
-**示例：**
-```blueprint
-SpawnActor
-  Class: BP_Enemy
-  Transform: SpawnTransform
-  Owner: this
-```
-
-**目标C++代码：**
-```cpp
-if (GetWorld()) {
-    FActorSpawnParameters SpawnParams;
-    SpawnParams.Owner = this;
-    AEnemy* NewEnemy = GetWorld()->SpawnActor<AEnemy>(
-        ABP_Enemy::StaticClass(),
-        SpawnTransform
-    );
-    // TODO: verify spawn parameters
-}
-```
-
----
-
-#### 11. **UK2Node_DynamicCast** — Cast (动态转换)
-- **用途：** 运行时类型检查与转换
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** 部分TODO
-- **转换难度：** 🟢 低
-- **预计工时：** 1-2天
-
-**问题：** 需识别目标类型、输入对象
-
-**示例：**
-```blueprint
-Cast to Character
-  Object: ActorRef
-  → Cast (Character output)
-  → Failed (null output)
-```
-
-**目标C++代码：**
-```cpp
-if (ACharacter* CastedCharacter = Cast<ACharacter>(ActorRef)) {
-    // Use CastedCharacter
-} else {
-    // Cast failed
-}
-```
+**参考:** ForLoop, ForLoopWithBreak, WhileLoop, DoN, Timeline, Delay, SpawnActor, DynamicCast
 
 ---
 
 ### 第二类：函数/调用节点（8个）
 
-#### 12. **UK2Node_ConstructObjectFromClass** — Construct Object from Class
-- **用途：** 从Class对象构造UObject实例
-- **使用频率：** ⭐⭐ 中等偏低
-- **生成代码：** TODO
-- **转换难度：** 🟡 中
-- **预计工时：** 2-3天
-
-**问题：** 需识别类型参数、构造参数
-
----
-
-#### 13. **UK2Node_CreateDelegate** — Create Event/Create Delegate
-- **用途：** 创建委托/事件绑定
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** TODO
-- **转换难度：** 🔴 高
-- **预计工时：** 5-7天
-
-**问题：** 委托系统复杂，需映射到 `BindDynamic`、`BindUFunction` 等
-
-**替代方案：** 生成带TODO的委托绑定框架
-
----
-
-#### 14. **UK2Node_CallDelegate** — Call Delegate
-- **用途：** 执行委托
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** TODO
-- **转换难度：** 🟡 中
-- **预计工时：** 2-3天
-
-**问题：** 需识别委托变量、参数
-
----
-
-#### 15. **UK2Node_CallArrayFunction** — Array操作节点
-- **用途：** Array的Add、Remove、Clear等操作
-- **使用频率：** ⭐⭐⭐⭐ 很高
-- **生成代码：** TODO
-- **转换难度：** 🟡 中
-- **预计工时：** 2-3天
-
-**问题：** 需识别具体的Array函数（Add、Remove、Find等）
-
-**示例：**
-```blueprint
-Array Add (to array, new item)
-```
-
-**目标C++代码：**
-```cpp
-MyArray.Add(NewItem);  // or emplace for complex types
-```
-
----
-
-#### 16. **UK2Node_CallMapFunction** — Map操作节点
-- **用途：** Map的Add、Remove、Find等操作
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** TODO
-- **转换难度：** 🟡 中
-- **预计工时：** 2-3天
-
-**问题：** 需识别具体的Map函数
-
----
-
-#### 17. **UK2Node_CallSetFunction** — Set操作节点
-- **用途：** Set的Add、Remove、Contains等操作
-- **使用频率：** ⭐⭐ 中等偏低
-- **生成代码：** TODO
-- **转换难度：** 🟡 中
-- **预计工时：** 2-3天
-
----
-
-#### 18. **UK2Node_GetClassDefaults** — Get Class Defaults
-- **用途：** 获取类的CDO属性
-- **使用频率：** ⭐⭐ 中等偏低
-- **生成代码：** TODO
-- **转换难度：** 🟡 中
-- **预计工时：** 2-3天
-
-**问题：** 需识别类引用、属性名
-
----
-
-#### 19. **UK2Node_GetEnumValue** — Get Enum by Index (虽然通常可工作)
-- **用途：** 从Enum获取值
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** 部分自动
-- **转换难度：** 🟢 低
-- **预计工时：** 1天
+参考原文档
 
 ---
 
 ### 第三类：事件/消息节点（5个）
 
-#### 20. **UK2Node_CustomEvent** — Custom Event
-- **用途：** 自定义事件（可从其他地方调用）
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** TODO
-- **转换难度：** 🟡 中
-- **预计工时：** 2-3天
-
-**问题：** 需为每个Custom Event生成UFUNCTION，记录参数
-
----
-
-#### 21. **UK2Node_CallParentFunction** — Call Parent Function
-- **用途：** 调用父类同名函数
-- **使用频率：** ⭐⭐ 中等偏低
-- **生成代码：** TODO
-- **转换难度：** 🟢 低
-- **预计工时：** 1-2天
-
-**问题：** 简单替换为 `Super::FunctionName()`
-
----
-
-#### 22. **UK2Node_InputActionEvent** — Input Action Event
-- **用途：** 响应输入系统事件
-- **使用频率：** ⭐⭐⭐⭐ 很高
-- **生成代码：** TODO
-- **转换难度：** 🔴 高
-- **预计工时：** 5-7天
-
-**问题：** 需整合Enhanced Input System，映射InputAction资源
-
----
-
-#### 23. **UK2Node_InputKeyEvent** — Input Key Event
-- **用途：** 响应按键输入
-- **使用频率：** ⭐⭐⭐⭐ 很高
-- **生成代码：** TODO
-- **转换难度：** 🔴 高
-- **预计工时：** 5-7天
-
-**问题：** 需映射到 `SetupPlayerInputComponent()`
-
----
-
-#### 24. **UK2Node_InputActionValue** — Get Input Action Value
-- **用途：** 获取输入Action的值（模拟摇杆等）
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** TODO
-- **转换难度：** 🔴 高
-- **预计工时：** 5-7天
+参考原文档
 
 ---
 
 ### 第四类：Reroute/工具节点（7个）
 
-#### 25. **UK2Node_Reroute** — Reroute Node
-- **用途：** 重新路由执行流（美化布局）
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** 无需代码（透传）
-- **转换难度：** 🟢 低
-- **预计工时：** 1天
-
-**问题：** 应直接透传，不生成代码
-
-**解决：** 在遍历时跳过此节点
-
----
-
-#### 26. **UK2Node_Comment** — Comment
-- **用途：** 注释框
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** 无需代码
-- **转换难度：** 🟢 低
-- **预计工时：** <1天
-
-**问题：** 应直接忽略
-
----
-
-#### 27. **UK2Node_Knot** — Knot (数据路由)
-- **用途：** 数据节点的重新路由
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** 无需代码
-- **转换难度：** 🟢 低
-- **预计工时：** <1天
-
----
-
-#### 28. **UK2Node_BreakStruct/MakeStruct** — Break/Make Struct
-- **用途：** Struct拆解/合成
-- **使用频率：** ⭐⭐⭐⭐ 很高
-- **生成代码：** 部分自动
-- **转换难度：** 🟡 中
-- **预计工时：** 2-3天
-
-**问题：** 需识别Struct类型、成员
-
-**示例：**
-```blueprint
-Make Transform
-  Location: FVector(0, 0, 0)
-  Rotation: FRotator(0, 0, 0)
-  Scale: FVector(1, 1, 1)
-  → Transform output
-```
-
-**目标C++代码：**
-```cpp
-FTransform Transform(
-    FRotator(0, 0, 0).Quaternion(),
-    FVector(0, 0, 0),
-    FVector(1, 1, 1)
-);
-```
-
----
-
-#### 29. **UK2Node_BreakArray** — Break Array Element
-- **用途：** 数组索引访问
-- **使用频率：** ⭐⭐⭐⭐ 很高
-- **生成代码：** 部分自动
-- **转换难度：** 🟢 低
-- **预计工时：** 1-2天
-
-**问题：** 简单替换为 `Array[Index]`
-
----
-
-#### 30. **UK2Node_Tunnel** — Tunnel Pins (在宏中)
-- **用途：** 宏的输入输出引脚
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** 需与Macro展开配合
-- **转换难度：** 🔴 高
-- **预计工时：** 宏展开的一部分
+参考原文档
 
 ---
 
 ### 第五类：渲染/物理/特殊节点（8个）
 
-#### 31. **UK2Node_GetActorBounds** — Get Actor Bounds
-- **用途：** 获取Actor碰撞体积
-- **使用频率：** ⭐⭐ 中等偏低
-- **生成代码：** 部分自动
-- **转换难度：** 🟢 低
-- **预计工时：** 1天
-
-**问题：** 简单调用 `GetActorBounds()`
-
----
-
-#### 32. **UK2Node_GetRenderedPrimitives** — Get Scene Captures
-- **用途：** 获取渲染的Primitive组件
-- **使用频率：** ⭐ 罕见
-- **生成代码：** TODO
-- **转换难度：** 🔴 高
-- **预计工时：** 7-10天
-
-**问题：** 涉及渲染系统深度集成
-
----
-
-#### 33. **UK2Node_ExecuteConsoleCommand** — Execute Console Command
-- **用途：** 执行控制台命令
-- **使用频率：** ⭐⭐ 中等偏低
-- **生成代码：** TODO
-- **转换难度：** 🟢 低
-- **预计工时：** 1-2天
-
-**问题：** 调用 `GEngine->Exec()`
-
----
-
-#### 34. **UK2Node_PrintString** — Print String (Should be auto-handled)
-- **用途：** 打印到屏幕
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** 部分自动
-- **转换难度：** 🟢 低
-- **预计工时：** 1天
-
-**问题：** 应映射到 `GEngine->AddOnScreenDebugMessage()` 或 `UE_LOG()`
-
----
-
-#### 35. **UK2Node_DrawDebugLine** — Draw Debug X (Line/Box/Circle等)
-- **用途：** 调试绘制
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** 部分自动
-- **转换难度：** 🟢 低
-- **预计工时：** 1-2天
-
-**问题：** 映射到 `DrawDebugLine()` 等API
-
----
-
-#### 36. **UK2Node_WaitLatentAction** — Wait Latent Action (基类)
-- **用途：** 异步操作等待（Load Async等）
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** TODO
-- **转换难度：** 🔴 高
-- **预计工时：** 7-10天
-
-**问题：** 需深度理解Latent Action机制，映射到异步API
-
----
-
-#### 37. **UK2Node_LoadAsset** — Load Asset Async
-- **用途：** 异步加载资源
-- **使用频率：** ⭐⭐⭐⭐ 很高
-- **生成代码：** TODO
-- **转换难度：** 🔴 高
-- **预计工时：** 5-7天
-
-**问题：** 需映射到 `StreamableManager` 或 `FStreamableHandle`
-
-**示例：**
-```blueprint
-Load Asset Async
-  Asset: "/Game/Meshes/MyMesh"
-  → OnLoaded (with loaded asset)
-  → OnFailed
-```
-
-**目标C++代码：**
-```cpp
-IStreamingManager::Get().GetStreamingEngine()->GetStreamableManager().RequestAsyncLoad(
-    FSoftObjectPath(AssetPath),
-    [this](const FString& Path, TSharedPtr<IStreamable> Asset, EAsyncIOPriority Priority)
-    {
-        if (Asset.IsValid()) {
-            // OnLoaded
-        } else {
-            // OnFailed
-        }
-    }
-);
-```
-
----
-
-#### 38. **UK2Node_AsyncAction** — Async Action (基类)
-- **用途：** 异步操作
-- **使用频率：** ⭐⭐⭐ 中高
-- **生成代码：** TODO
-- **转换难度：** 🔴 高
-- **预计工时：** 7-10天
-
-**问题：** 各种AsyncAction有不同的签名和行为
-
----
+参考原文档
 
 ---
 
 ## 部分支持的节点
 
-这些节点虽然在代码中有处理，但生成的C++代码仍需人工补全。
-
 ### 1. **UK2Node_CallFunction** — 函数调用
 
 **当前状态：** ✅ 识别 + 📝 生成TODO框架  
 **完成度：** 60%
+
+**关联系统TODO：** [TODO-3](#todo-3uK2node_callfunction-参数提取与代码生成)  
+**关联表格TODO：** [TODO-A](#todo-auK2node_callfunction--函数调用)
 
 **当前生成：**
 ```cpp
@@ -653,18 +480,10 @@ IStreamingManager::Get().GetStreamingEngine()->GetStreamableManager().RequestAsy
 // TODO: implement call to MyFunction on ACharacter.
 ```
 
-**改进后应生成：**
-```cpp
-// Call: MyFunction()
-if (IsValid(this)) {
-    MyFunction(); // TODO: verify parameters
-}
-```
-
 **需完成的工作：**
 - ✅ 提取函数名和目标类
 - ✅ 识别是否为自身调用
-- ❌ 提取调用参数
+- ❌ 提取调用参数（对应 TODO-3）
 - ❌ 生成参数列表
 - ❌ 处理返回值
 
@@ -675,22 +494,14 @@ if (IsValid(this)) {
 **当前状态：** ❌ 标记为Unsupported + 📝 生成TODO  
 **完成度：** 10%
 
-**当前生成：**
-```cpp
-// TODO: macro 'MyMacro' must be expanded manually.
-```
-
-**改进后应生成：**
-```cpp
-// Macro: MyMacro (expanded)
-// [宏内的所有节点被递归展开]
-```
+**关联系统TODO：** [TODO-4](#todo-4uK2node_macroinstance-宏展开)  
+**关联表格TODO：** [TODO-B](#todo-buK2node_macroinstance--宏实例)
 
 **需完成的工作：**
 - ❌ 递归访问宏内的Graph
 - ❌ 展开宏的Tunnel入口
 - ❌ 参数映射
-- ❌ 循环检测（防止宏调用宏的无限递归）
+- ❌ 循环检测
 
 ---
 
@@ -698,18 +509,6 @@ if (IsValid(this)) {
 
 **当前状态：** ✅ 识别 + 📝 生成注释  
 **完成度：** 40%
-
-**当前生成：**
-```cpp
-// VariableGet: MyVariable
-// VariableSet: MyVariable
-```
-
-**改进后应生成：**
-```cpp
-int32 Value = MyVariable;  // Get
-MyVariable = NewValue;      // Set
-```
 
 **需完成的工作：**
 - ✅ 识别变量名
@@ -719,623 +518,249 @@ MyVariable = NewValue;      // Set
 
 ---
 
----
-
 ## 实现优先级
 
-### 🚀 第一梯队（第1-2周）— 高频 + 低难度
+### 🚀 **紧急优先级（第1周）— 系统级TODO**
 
-| 节点 | 类型 | 难度 | 工时 | 使用频率 | 收益 |
-|------|------|------|------|---------|------|
-| UK2Node_Delay | 执行 | 🟢 低 | 1-2天 | ⭐⭐⭐⭐ | 高 |
-| UK2Node_DynamicCast | 数据 | 🟢 低 | 1-2天 | ⭐⭐⭐ | 中高 |
-| UK2Node_Select | 数据 | 🟢 低 | 1-2天 | ⭐⭐⭐⭐ | 高 |
-| UK2Node_SpawnActor | 执行 | 🟢 低 | 1-2天 | ⭐⭐⭐⭐ | 高 |
-| UK2Node_PrintString | 工具 | 🟢 低 | 1天 | ⭐⭐⭐ | 中 |
-| UK2Node_ForLoop | 执行 | 🟡 中 | 3-4天 | ⭐⭐⭐⭐ | 高 |
-| UK2Node_Switch | 数据 | 🟡 中 | 2-3天 | ⭐⭐⭐⭐ | 高 |
-| UK2Node_CallArrayFunction | 执行 | 🟡 中 | 2-3天 | ⭐⭐⭐⭐ | 高 |
+| 任务 | 类型 | 难度 | 工时 | 完成度提升 | 总优先级 |
+|------|------|------|------|----------|---------|
+| TMap Key类型系统 | 系统 | 🟢 低 | 2-3天 | +20% | **第1位** |
+| 事件映射完整化 | 系统 | 🟢 低 | 2-3天 | +30% | **第2位** |
+| CallFunction参数提取 | 系统 | 🟡 中 | 3-4天 | +15% | **第3位** |
 
-**累计工时：** 14-20天  
-**预期完成度提升：** ~35%
+**小计：** 7-10天 → **+65% 完成度**（30% → 95%自动化）
 
 ---
 
-### 🟡 第二梯队（第3-4周）— 中频 + 中难度
+### 🔴 **高优先级（第2-3周）— 节点支持**
 
-| 节点 | 类型 | 难度 | 工时 | 使用频率 | 收益 |
-|------|------|------|------|---------|------|
-| UK2Node_CallDelegate | 执行 | 🟡 中 | 2-3天 | ⭐⭐⭐ | 中 |
-| UK2Node_BreakStruct/MakeStruct | 工具 | 🟡 中 | 2-3天 | ⭐⭐⭐⭐ | 高 |
-| UK2Node_CustomEvent | 事件 | 🟡 中 | 2-3天 | ⭐⭐⭐ | 中高 |
-| UK2Node_CallMapFunction | 执行 | 🟡 中 | 2-3天 | ⭐⭐⭐ | 中 |
-| UK2Node_DoN | 执行 | 🟡 中 | 2-3天 | ⭐⭐ | 低 |
-| UK2Node_MultiGate | 执行 | 🟡 中 | 3-4天 | ⭐⭐ | 低 |
-| UK2Node_DrawDebugLine | 工具 | 🟢 低 | 1-2天 | ⭐⭐⭐ | 中 |
-| UK2Node_ExecuteConsoleCommand | 工具 | 🟢 低 | 1-2天 | ⭐⭐ | 低 |
+| 节点 | 难度 | 工时 | 使用频率 | 收益 |
+|------|------|------|---------|------|
+| UK2Node_ForLoop | 🟡 中 | 3-4天 | ⭐⭐⭐⭐ | 高 |
+| UK2Node_Switch | 🟡 中 | 2-3天 | ⭐⭐⭐⭐ | 高 |
+| UK2Node_Delay | 🟢 低 | 1-2天 | ⭐⭐⭐⭐ | 高 |
 
-**累计工时：** 16-23天  
-**预期完成度提升：** ~25%  
-**总体完成度：** ~60%
-
----
-
-### 🔴 第三梯队（第5-6周）— 低频 或 高难度
-
-| 节点 | 类型 | 难度 | 工时 | 使用频率 | 收益 |
-|------|------|------|------|---------|------|
-| UK2Node_LoadAsset | 执行 | 🔴 高 | 5-7天 | ⭐⭐⭐⭐ | 高 |
-| UK2Node_InputActionEvent | 事件 | 🔴 高 | 5-7天 | ⭐⭐⭐⭐ | 高 |
-| UK2Node_InputKeyEvent | 事件 | 🔴 高 | 5-7天 | ⭐⭐⭐⭐ | 高 |
-| UK2Node_Timeline | 执行 | 🔴 高 | 7-10天 | ⭐⭐⭐ | 中 |
-| UK2Node_CreateDelegate | 执行 | 🔴 高 | 5-7天 | ⭐⭐⭐ | 中 |
-| UK2Node_WaitLatentAction | 执行 | 🔴 高 | 7-10天 | ⭐⭐⭐ | 中 |
-| UK2Node_AsyncAction | 执行 | 🔴 高 | 7-10天 | ⭐⭐⭐ | 中 |
-
-**累计工时：** 42-58天  
-**预期完成度提升：** ~25%  
-**总体完成度：** ~85%
-
----
-
-### ⚪ 第四梯队（优化阶段）— 边界情况
-
-| 节点 | 类型 | 难度 | 工时 | 收益 |
-|------|------|------|------|------|
-| Reroute/Knot/Comment | 工具 | 🟢 低 | <1天 | 低 |
-| GetRenderedPrimitives | 特殊 | 🔴 高 | 7-10天 | 极低 |
-| 其他罕见节点 | 混合 | 混合 | 变量 | 低 |
-
----
+**小计：** 6-9天 → **+15% 节点覆盖**
 
 ---
 
 ## 详细实现方案
 
-### 方案1：UK2Node_Delay — 延迟执行
+### 方案1：UK2Node_CallFunction — 完整实现
 
-#### C++侧改进（BlueprintBusterParsers.cpp）
+#### 第一步：C++侧参数提取（BlueprintBusterParsers.cpp）
 
 ```cpp
-// 在 TraceNode() 中添加
-if (const UK2Node_CallFunction* DelayNode = Cast<UK2Node_CallFunction>(InNode))
+// 扩展FBPGraphNodeInfo结构（BlueprintBusterTypes.h）
+struct FBPGraphNodeInfo
 {
-    // 检测是否为Delay节点
-    if (DelayNode->FunctionReference.GetMemberName() == FName("Delay"))
+    // ... existing fields ...
+    int32 FunctionParameterCount = 0;        // NEW
+    bool bIsSelfCall = false;                // NEW
+    TArray<FString> FunctionParameterNames;  // NEW
+};
+
+// 在TraceNode()中改进CallFunction处理（line 371-383）
+if (const UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(InNode))
+{
+    Info->NodeKind     = TEXT("CallFunction");
+    Info->FunctionName = CallNode->FunctionReference.GetMemberName().ToString();
+    Info->NodeLabel    = Info->FunctionName;
+
+    const UClass* TargetCls = CallNode->FunctionReference.GetMemberParentClass();
+    if (IsValid(TargetCls))
     {
-        Info->NodeKind  = TEXT("Delay");
-        Info->NodeLabel = TEXT("Delay");
-        
-        // 提取延迟时间参数
-        for (UEdGraphPin* Pin : DelayNode->Pins)
-        {
-            if (Pin && Pin->GetName() == "Duration" && Pin->Direction == EGPD_Input)
-            {
-                if (Pin->LinkedTo.Num() > 0)
-                {
-                    // 从连接获取
-                    Info->FunctionParameterCount++;
-                }
-                else if (!Pin->DefaultValue.IsEmpty())
-                {
-                    Info->NodeLabel = FString::Printf(TEXT("Delay (%.2fs)"), 
-                        FCString::Atof(*Pin->DefaultValue));
-                }
-            }
-        }
-        return Info;
-    }
-}
-```
-
-#### Python侧代码生成（bp_translator.py）
-
-```python
-def _emit_node_chain(root: GraphNode, indent: int) -> List[str]:
-    def emit_node(node: GraphNode, depth: int) -> None:
-        local_pad = "    " * depth
-        
-        if node.kind == "Delay":
-            duration = node.label.split("(")[-1].rstrip("s)") if "(" in node.label else "1.0"
-            out.append(f"{local_pad}// Delay: {node.label}")
-            out.append(
-                f"{local_pad}GetWorld()->GetTimerManager().SetTimer("
-            )
-            out.append(
-                f"{local_pad}    DelayHandle_{depth},"
-            )
-            out.append(
-                f"{local_pad}    this,"
-            )
-            out.append(
-                f"{local_pad}    &{node.class_name}::OnDelayComplete_{depth},"
-            )
-            out.append(
-                f"{local_pad}    {duration}f,"
-            )
-            out.append(
-                f"{local_pad}    false  // TODO: set to true for looping"
-            )
-            out.append(
-                f"{local_pad});"
-            )
-```
-
-#### 生成的.h文件
-
-```cpp
-private:
-    FTimerHandle DelayHandle_1;
-    
-    void OnDelayComplete_1();
-```
-
-#### 生成的.cpp文件
-
-```cpp
-void AMyActor::OnDelayComplete_1()
-{
-    // TODO: implement logic after delay
-}
-```
-
----
-
-### 方案2：UK2Node_ForLoop — 循环
-
-#### C++侧改进
-
-```cpp
-if (const UK2Node_CallFunction* ForLoopNode = Cast<UK2Node_CallFunction>(InNode))
-{
-    if (ForLoopNode->FunctionReference.GetMemberName() == FName("ForLoop"))
-    {
-        Info->NodeKind  = TEXT("ForLoop");
-        Info->NodeLabel = TEXT("ForLoop");
-        
-        // 提取First Index, Last Index
-        int32 FirstIdx = 0, LastIdx = 10;
-        for (UEdGraphPin* Pin : ForLoopNode->Pins)
-        {
-            if (Pin->GetName() == "First Index" && !Pin->DefaultValue.IsEmpty())
-                FirstIdx = FCString::Atoi(*Pin->DefaultValue);
-            if (Pin->GetName() == "Last Index" && !Pin->DefaultValue.IsEmpty())
-                LastIdx = FCString::Atoi(*Pin->DefaultValue);
-        }
-        
-        Info->LoopFirstIndex = FirstIdx;
-        Info->LoopLastIndex = LastIdx;
-        
-        // 追踪Loop Body执行链
-        for (UEdGraphPin* Pin : ForLoopNode->Pins)
-        {
-            if (Pin->GetName() == "Loop Body" && Pin->Direction == EGPD_Output)
-            {
-                if (const UEdGraphNode* LoopBody = GetLinkedExecNode(Pin))
-                {
-                    TraceLinearChain(LoopBody, Depth + 1, MaxDepth, VisitedThisChain,
-                                   Info->LoopBody, OutTotalCount, OutUnsupportedCount);
-                }
-            }
-        }
-        
-        return Info;
-    }
-}
-```
-
-#### Python侧代码生成
-
-```python
-if node.kind == "ForLoop":
-    first = node.loop_first_index if hasattr(node, 'loop_first_index') else 0
-    last = node.loop_last_index if hasattr(node, 'loop_last_index') else 10
-    
-    out.append(f"{local_pad}for (int32 Index = {first}; Index <= {last}; ++Index)")
-    out.append(f"{local_pad}{{")
-    
-    # 递归生成Loop Body
-    if node.next:
-        for child in node.next:
-            emit_node(child, depth + 1)
-    else:
-        out.append(f"{local_pad}    // TODO: implement loop body")
-    
-    out.append(f"{local_pad}}}")
-    out.append("")
-    out.append(f"{local_pad}// Loop complete")
-```
-
-#### 生成的C++代码
-
-```cpp
-for (int32 Index = 0; Index <= 10; ++Index)
-{
-    // Loop body
-    // TODO: implement loop logic with Index
-}
-// Loop complete
-```
-
----
-
-### 方案3：UK2Node_MacroInstance — 宏展开
-
-#### C++侧递归展开
-
-```cpp
-static void ExpandMacroGraph(const UK2Node_MacroInstance* MacroNode,
-                            int32 Depth,
-                            int32 MaxDepth,
-                            TSet<const UEdGraphNode*>& VisitedThisChain,
-                            TArray<TSharedPtr<FBPGraphNodeInfo>>& OutExpanded,
-                            int32& OutTotalCount,
-                            int32& OutUnsupportedCount)
-{
-    if (!MacroNode || Depth >= MaxDepth)
-        return;
-
-    UEdGraph* MacroGraph = MacroNode->GetMacroGraph();
-    if (!IsValid(MacroGraph))
-        return;
-
-    // 防止无限循环：宏不应该调用自己
-    if (VisitedThisChain.Contains(MacroNode))
-        return;
-    
-    VisitedThisChain.Add(MacroNode);
-
-    // 查找宏的执行入口（Tunnel FunctionEntry）
-    UK2Node_Tunnel* EntryTunnel = nullptr;
-    for (UEdGraphNode* Node : MacroGraph->Nodes)
-    {
-        if (UK2Node_Tunnel* Tunnel = Cast<UK2Node_Tunnel>(Node))
-        {
-            if (Tunnel->IsA<UK2Node_FunctionEntry>())
-            {
-                EntryTunnel = Tunnel;
-                break;
-            }
-        }
+        Info->TargetClassPath = TargetCls->GetPathName();
     }
 
-    if (!EntryTunnel)
-        return;
-
-    // 从Tunnel的Then引脚开始追踪
-    for (UEdGraphPin* Pin : EntryTunnel->Pins)
+    // NEW: 提取参数信息
+    Info->bIsSelfCall = false;  // TODO: 检测是否为自身调用
+    Info->FunctionParameterCount = 0;
+    
+    for (UEdGraphPin* Pin : CallNode->Pins)
     {
-        if (Pin && Pin->Direction == EGPD_Output &&
-            Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+        if (Pin && Pin->Direction == EGPD_Input &&
+            Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
         {
-            if (const UEdGraphNode* FirstBodyNode = GetLinkedExecNode(Pin))
-            {
-                TraceLinearChain(FirstBodyNode, Depth + 1, MaxDepth, VisitedThisChain,
-                               OutExpanded, OutTotalCount, OutUnsupportedCount);
-            }
-            break;
+            Info->FunctionParameterCount++;
+            Info->FunctionParameterNames.Add(Pin->GetName().ToString());
         }
-    }
-}
-
-// 在 TraceNode 中修改Macro处理
-if (const UK2Node_MacroInstance* MacroNode = Cast<UK2Node_MacroInstance>(InNode))
-{
-    Info->NodeKind  = TEXT("MacroInstance");
-    Info->NodeLabel = MacroNode->GetMacroGraph()
-        ? MacroNode->GetMacroGraph()->GetName()
-        : TEXT("UnknownMacro");
-
-    UEdGraph* MacroGraph = MacroNode->GetMacroGraph();
-    if (IsValid(MacroGraph))
-    {
-        // 尝试展开宏内容
-        TArray<TSharedPtr<FBPGraphNodeInfo>> ExpandedNodes;
-        ExpandMacroGraph(MacroNode, Depth, MaxDepth, VisitedThisChain,
-                        ExpandedNodes, OutTotalCount, OutUnsupportedCount);
-        
-        if (ExpandedNodes.Num() > 0)
-        {
-            // 成功展开
-            Info->Next = ExpandedNodes;
-            Info->UnsupportedReason = "";  // 不是unsupported了
-        }
-        else
-        {
-            // 宏为空或展开失败
-            Info->UnsupportedReason = TEXT("Macro body is empty or circular");
-            ++OutUnsupportedCount;
-        }
-    }
-    else
-    {
-        Info->UnsupportedReason = TEXT("Macro graph not found");
-        ++OutUnsupportedCount;
     }
     
     return Info;
 }
 ```
 
-#### Python侧展开处理
+#### 第二步：Python侧代码生成（bp_translator.py）
 
 ```python
 def _emit_node_chain(root: GraphNode, indent: int) -> List[str]:
+    """Emits the linear chain (root + root.next + branches)."""
+    pad = "    " * indent
+    out: List[str] = []
+
     def emit_node(node: GraphNode, depth: int) -> None:
         local_pad = "    " * depth
         
-        if node.kind == "MacroInstance":
-            if node.unsupported:
-                # 宏无法展开
+        if node.kind == "CallFunction":
+            # IMPROVED: 生成可工作的调用代码
+            func_name = node.function_name or "UnknownFunction"
+            target = node.target_class or "this"
+            
+            # 精简目标类名
+            if target and "::" in target:
+                target = target.split("::")[-1]
+            
+            out.append(f"{local_pad}// Call: {func_name}()")
+            
+            if node.is_self_call or "this" in target.lower():
+                # 自身方法调用
                 out.append(
-                    f"{local_pad}// ❌ Macro '{node.label}' failed to expand: {node.unsupported}"
+                    f"{local_pad}{func_name}(); "
+                    f"// TODO: verify parameters{f' ({node.parameter_count} params)' if node.parameter_count else ''}"
                 )
             else:
-                # 宏成功展开
-                out.append(f"{local_pad}// Macro: {node.label} ▼ (expanded)")
-                # 递归生成宏体
-                for child in node.next:
-                    emit_node(child, depth)
-                out.append(f"{local_pad}// Macro: {node.label} ▲ (end)")
-                return  # 不再处理node.next（已处理过了）
+                # 外部对象方法调用
+                out.append(f"{local_pad}if (IsValid({target}))")
+                out.append(f"{local_pad}{{")
+                out.append(
+                    f"{local_pad}    {target}->{func_name}(); "
+                    f"// TODO: verify parameters"
+                )
+                out.append(f"{local_pad}}}")
 ```
 
-#### 生成的C++代码
+#### 生成效果
 
+**前：**
 ```cpp
-// Macro: MakeDamageInfo ▼ (expanded)
-// VariableSet: DamageAmount
-DamageAmount = 50.0f;
-// Call: ApplyDamage
-ApplyDamage(); // TODO: verify parameters
-// Macro: MakeDamageInfo ▲ (end)
+// Call: InitializeDialogue
+// TODO: implement call to InitializeDialogue on ACharacter.
 ```
+
+**后：**
+```cpp
+// Call: InitializeDialogue()
+InitializeDialogue(); // TODO: verify parameters (2 params)
+
+// 或
+// Call: PlayAnimation on CharacterRef
+if (IsValid(CharacterRef)) {
+    CharacterRef->PlayAnimation(); // TODO: verify parameters
+}
+```
+
+---
+
+### 方案2：UK2Node_Delay — 延迟执行
+
+参考原文档 line 795-880
+
+---
+
+### 方案3：UK2Node_MacroInstance — 宏展开
+
+参考原文档 line 962-1090
 
 ---
 
 ### 方案4：UK2Node_Switch — Switch语句
 
-#### C++侧信息提取
-
-```cpp
-// 检测Switch节点（需要在Kismet/K2Node中查找）
-// UE5中可能是 UK2Node_Switch 或通过CallFunction模拟
-if (const UK2Node_CallFunction* SwitchNode = Cast<UK2Node_CallFunction>(InNode))
-{
-    if (SwitchNode->FunctionReference.GetMemberName().ToString().Contains("Switch"))
-    {
-        Info->NodeKind = TEXT("Switch");
-        Info->NodeLabel = TEXT("Switch");
-        
-        // 提取Switch的输入引脚（条件值）
-        for (UEdGraphPin* Pin : SwitchNode->Pins)
-        {
-            if (Pin && Pin->Direction == EGPD_Input &&
-                Pin->GetName() == "Selection")
-            {
-                if (!Pin->DefaultValue.IsEmpty())
-                {
-                    Info->SwitchValue = Pin->DefaultValue;
-                }
-            }
-        }
-        
-        // 提取所有Case分支
-        for (UEdGraphPin* Pin : SwitchNode->Pins)
-        {
-            if (Pin && Pin->Direction == EGPD_Output &&
-                Pin->GetName().Contains("Case"))
-            {
-                FString CaseName = Pin->GetName();
-                if (const UEdGraphNode* CaseNode = GetLinkedExecNode(Pin))
-                {
-                    TArray<TSharedPtr<FBPGraphNodeInfo>> CaseChain;
-                    TraceLinearChain(CaseNode, Depth + 1, MaxDepth, VisitedThisChain,
-                                   CaseChain, OutTotalCount, OutUnsupportedCount);
-                    Info->SwitchCases.Add({CaseName, CaseChain});
-                }
-            }
-        }
-        
-        // 提取Default分支
-        for (UEdGraphPin* Pin : SwitchNode->Pins)
-        {
-            if (Pin && Pin->Direction == EGPD_Output &&
-                Pin->GetName() == "Default")
-            {
-                if (const UEdGraphNode* DefaultNode = GetLinkedExecNode(Pin))
-                {
-                    TraceLinearChain(DefaultNode, Depth + 1, MaxDepth, VisitedThisChain,
-                                   Info->SwitchDefault, OutTotalCount, OutUnsupportedCount);
-                }
-            }
-        }
-        
-        return Info;
-    }
-}
-```
-
-#### Python侧代码生成
-
-```python
-if node.kind == "Switch":
-    out.append(f"{local_pad}// Switch statement")
-    out.append(f"{local_pad}switch (/* TODO: switch value */)")
-    out.append(f"{local_pad}{{")
-    
-    if hasattr(node, 'switch_cases') and node.switch_cases:
-        for case_name, case_nodes in node.switch_cases:
-            case_label = case_name.replace("Case_", "")
-            out.append(f"{local_pad}    case {case_label}:")
-            
-            # 递归生成case体
-            for child in case_nodes:
-                emit_node(child, depth + 2)
-            
-            out.append(f"{local_pad}        break;")
-    
-    # Default分支
-    if hasattr(node, 'switch_default') and node.switch_default:
-        out.append(f"{local_pad}    default:")
-        for child in node.switch_default:
-            emit_node(child, depth + 2)
-        out.append(f"{local_pad}        break;")
-    
-    out.append(f"{local_pad}}}")
-```
-
-#### 生成的C++代码
-
-```cpp
-// Switch statement
-switch (/* TODO: switch value */)
-{
-    case 0:
-        // VariableSet: DialogueState
-        DialogueState = 1;
-        break;
-    case 1:
-        // Call: PlayDialogue
-        PlayDialogue(); // TODO: verify parameters
-        break;
-    default:
-        // Call: HandleDefault
-        HandleDefault(); // TODO: verify parameters
-        break;
-}
-```
+参考原文档最后部分
 
 ---
 
 ## 实现检查清单
 
-### 第一阶段检查清单（Week 1-2）
+### 第一阶段检查清单（Week 1）— 系统级TODO
 
-- [ ] UK2Node_Delay 实现完成
-- [ ] UK2Node_DynamicCast 实现完成
-- [ ] UK2Node_Select 实现完成
-- [ ] UK2Node_SpawnActor 实现完成
+- [ ] TODO-1：TMap Key类型系统完成
+  - [ ] C++侧KeyType导出
+  - [ ] JSON序列化更新
+  - [ ] Python侧解析和生成
+  - [ ] 单元测试（5个用例）
+
+- [ ] TODO-2：事件映射完整化
+  - [ ] BeginPlay映射实现
+  - [ ] Tick映射实现
+  - [ ] EndPlay映射实现
+  - [ ] 集成测试通过
+
+- [ ] TODO-3：CallFunction参数提取
+  - [ ] C++侧参数信息收集
+  - [ ] Python侧调用代码生成
+  - [ ] 参数列表验证
+  - [ ] 完整集成测试
+
+### 第二阶段检查清单（Week 2）— 节点支持
+
 - [ ] UK2Node_ForLoop 实现完成
 - [ ] UK2Node_Switch 实现完成
-- [ ] 单元测试覆盖（至少50个测试用例）
-- [ ] 文档更新：README.md 表格更新
-- [ ] 集成测试通过
+- [ ] UK2Node_Delay 实现完成
+- [ ] 所有第一阶段TODO仍可工作（回归测试）
 
-### 第二阶段检查清单（Week 3-4）
+### 第三阶段检查清单（Week 3-4）— 扩展支持
 
-- [ ] UK2Node_CallDelegate 实现完成
-- [ ] UK2Node_BreakStruct/MakeStruct 实现完成
-- [ ] UK2Node_CustomEvent 实现完成
-- [ ] UK2Node_MacroInstance 展开实现完成
-- [ ] 回归测试通过（所有第一阶段节点仍可工作）
-- [ ] 性能基准测试（处理大型Blueprint的时间）
-
-### 第三阶段检查清单（Week 5-6）
-
-- [ ] UK2Node_LoadAsset 实现完成
-- [ ] UK2Node_InputActionEvent/InputKeyEvent 实现完成
-- [ ] 异步节点处理能力
+- [ ] UK2Node_MacroInstance 展开实现
+- [ ] 其他高优先级节点
 - [ ] 最终集成测试
-- [ ] README/INSTRUCTION 完整更新
-
----
-
-## 辅助工具建议
-
-### 1. 节点诊断工具
-
-创建Python脚本，扫描所有JSON dumpfile并统计未支持节点：
-
-```python
-# analyze_unsupported.py
-import json
-import sys
-from collections import defaultdict
-
-def analyze_dump(dump_path):
-    with open(dump_path, 'r') as f:
-        dump = json.load(f)
-    
-    unsupported = defaultdict(list)
-    
-    def collect_unsupported(node, path=""):
-        if node.get("kind") == "Unsupported":
-            node_type = node.get("label", "Unknown")
-            reason = node.get("unsupported", "")
-            unsupported[node_type].append({
-                "path": path,
-                "reason": reason
-            })
-        
-        for child in node.get("next", []) + node.get("true", []) + node.get("false", []):
-            collect_unsupported(child, path + " > " + node.get("label", "?"))
-    
-    for tree in dump.get("eventTrees", []):
-        if tree.get("event"):
-            collect_unsupported(tree["event"], f"Event:{tree.get('graphName')}")
-    
-    for func in dump.get("customFunctions", []):
-        if func.get("functionRoot"):
-            collect_unsupported(func["functionRoot"], f"Function:{func.get('functionName')}")
-    
-    return unsupported
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python analyze_unsupported.py <dump_file>")
-        sys.exit(1)
-    
-    unsupported = analyze_dump(sys.argv[1])
-    
-    print(f"\nFound {sum(len(v) for v in unsupported.values())} unsupported nodes")
-    for node_type, instances in sorted(unsupported.items()):
-        print(f"\n{node_type}: {len(instances)} instance(s)")
-        for inst in instances[:3]:  # 显示前3个
-            print(f"  - {inst['path']}")
-            if inst['reason']:
-                print(f"    Reason: {inst['reason']}")
-```
-
-### 2. 代码覆盖率跟踪
-
-添加到CI/CD中：
-
-```bash
-# 统计支持的节点类型占比
-python -m pytest tests/ --cov=bp_translator --cov-report=term-missing
-```
-
----
-
-## 参考资源
-
-### UE5官方文档
-
-- [K2Node API Reference](https://docs.unrealengine.com/5.0/en-US/API/)
-- [Blueprint Scripting Documentation](https://docs.unrealengine.com/5.0/en-US/BlueprintAPI/)
-
-### 相关论文/博客
-
-- UE5 Blueprint优化最佳实践
-- C++与Blueprint的性能对比分析
+- [ ] README和INSTRUCTION更新
 
 ---
 
 ## 贡献指南
 
-如需添加新节点支持：
+### 处理TODO的标准流程
 
-1. 在本文档中新增节点条目
-2. 创建专用PR，标题格式：`[Feature] Add support for UK2Node_XXX`
-3. 包含：
-   - C++侧实现（BlueprintBusterParsers.cpp）
-   - Python侧代码生成（bp_translator.py）
-   - 至少3个测试用例
-   - README.md 更新
+1. **选择TODO任务**
+   - 从优先级列表中选择
+   - 更新 `UNSUPPORTED_NODES.md` 中的进度
+
+2. **实现修改**
+   - 按提供的方案代码编写
+   - C++侧 + Python侧同时修改
+   - 添加至少3个测试用例
+
+3. **提交PR**
+   - 标题格式：`[TODO-X] Description`
+   - 描述中链接此文档
+   - 包含：代码 + 测试 + 文档更新
+
+4. **审核标准**
+   - ✅ 所有测试通过
+   - ✅ 生成代码无明显缺陷
+   - ✅ 文档同步更新
+   - ✅ 完成度统计更新
+
+---
+
+## 快速参考
+
+### 按优先级快速查找
+
+| 优先级 | 任务 | 文档位置 |
+|--------|------|---------|
+| 🔴 紧急 | TODO-1: TMap系统 | [链接](#todo-1tmap-类型系统不完整) |
+| 🔴 紧急 | TODO-2: 事件映射 | [链接](#todo-2事件节点映射不完整beingplayticketc) |
+| 🔴 紧急 | TODO-3: CallFunction | [链接](#todo-3uK2node_callfunction-参数提取与代码生成) |
+| 🔴 紧急 | TODO-4: Macro展开 | [链接](#todo-4uK2node_macroinstance-宏展开) |
+| 🟡 高 | TODO-A: 节点分类 | [链接](#todo-auK2node_callfunction--函数调用) |
+
+### 按文件位置快速查找
+
+| 文件 | TODO位置 | 行号 |
+|------|---------|------|
+| `BlueprintBusterParsers.cpp` | Map导出 | ~134 |
+| `BlueprintBusterParsers.cpp` | CallFunction参数 | ~371 |
+| `bp_translator.py` | 事件映射 | 703-711 |
+| `bp_translator.py` | 代码生成 | 828-842 |
+| `bp_translator.py` | Map生成 | 342, 390 |
+| `README.md` | TMap表格 | 131 |
+| `README.md` | 节点表格 | 97-104 |
 
 ---
 
 **Last Updated:** 2026-05-29  
 **Status:** Active Development  
 **Maintainer:** SeAmenLoo  
+**汇总整合：** 第一、二、三问题的所有TODO内容
