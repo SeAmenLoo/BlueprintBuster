@@ -66,7 +66,7 @@ void FBlueprintBusterModule::RegisterMenus()
     Section.AddMenuEntry(
         "BlueprintBuster_ConvertSelected",
         LOCTEXT("BlueprintBusterConvertSelectedLabel", "BlueprintBuster: Convert Selected Blueprints to C++"),
-        LOCTEXT("BlueprintBusterConvertSelectedTooltip", "Dump selected Blueprint assets to JSON and run the bundled Python translator to generate .h/.cpp."),
+        LOCTEXT("BlueprintBusterConvertSelectedTooltip", "Dump selected Blueprint assets to JSON (FullDump) and run the bundled Python translator to generate .h/.cpp."),
         FSlateIcon(),
         FUIAction(FExecuteAction::CreateRaw(this, &FBlueprintBusterModule::ConvertSelectedBlueprintsToCpp)));
 }
@@ -160,7 +160,7 @@ void FBlueprintBusterModule::ProcessSelectedBlueprints(bool bGenerateCpp)
         }
 
         const FString DumpFilePath = BlueprintBusterDump::MakeDumpFilePath(DumpDir, Blueprint);
-        if (!BlueprintBusterDump::DumpBlueprintToJsonFile(Blueprint, DumpFilePath, 64))
+        if (!BlueprintBusterDump::DumpBlueprintToJsonFile(Blueprint, DumpFilePath, 64, nullptr, bGenerateCpp))
         {
             continue;
         }

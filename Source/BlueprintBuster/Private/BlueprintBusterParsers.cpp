@@ -28,6 +28,7 @@
 #include "K2Node_FunctionResult.h"
 #include "K2Node_Tunnel.h"
 #include "UObject/Class.h"
+#include "UObject/FieldIterator.h"
 #include "UObject/UnrealNames.h"
 
 #include "UObject/UnrealType.h"
@@ -278,6 +279,7 @@ namespace BlueprintBusterParsers
                                                   int32 Depth,
                                                   int32 MaxDepth,
                                                   TSet<const UEdGraphNode*>& VisitedThisChain,
+                                                  TArray<const UEdGraph*>& MacroGraphStack,
                                                   int32& OutTotalCount,
                                                   int32& OutUnsupportedCount);
 
@@ -292,12 +294,190 @@ namespace BlueprintBusterParsers
         return InputPin ? InputPin->GetOwningNode() : nullptr;
     }
 
+    static const UEdGraphNode* GetFirstLinkedExecFromNode(const UEdGraphNode* InNode)
+    {
+        if (!InNode)
+        {
+            return nullptr;
+        }
+        for (UEdGraphPin* Pin : InNode->Pins)
+        {
+            if (Pin && Pin->Direction == EGPD_Output &&
+                Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+            {
+                return GetLinkedExecNode(Pin);
+            }
+        }
+        return nullptr;
+    }
+
+    static const UEdGraphNode* FindMacroEntryExecNode(const UEdGraph* InMacroGraph)
+    {
+        if (!IsValid(InMacroGraph))
+        {
+            return nullptr;
+        }
+
+        const UK2Node_Tunnel* BestEntry = nullptr;
+        for (const UEdGraphNode* Node : InMacroGraph->Nodes)
+        {
+            const UK2Node_Tunnel* Tunnel = Cast<UK2Node_Tunnel>(Node);
+            if (!Tunnel)
+            {
+                continue;
+            }
+
+            bool bHasExecOutput = false;
+            bool bHasExecInput  = false;
+            for (UEdGraphPin* Pin : Tunnel->Pins)
+            {
+                if (!Pin || Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+                {
+                    continue;
+                }
+                if (Pin->Direction == EGPD_Output)
+                {
+                    bHasExecOutput = true;
+                }
+                else if (Pin->Direction == EGPD_Input)
+                {
+                    bHasExecInput = true;
+                }
+            }
+
+            if (bHasExecOutput && !bHasExecInput)
+            {
+                BestEntry = Tunnel;
+                break;
+            }
+
+            if (!BestEntry && bHasExecOutput)
+            {
+                BestEntry = Tunnel;
+            }
+        }
+
+        return GetFirstLinkedExecFromNode(BestEntry);
+    }
+
+    static FString EscapeStringLiteral(const FString& InText)
+    {
+        FString Out = InText;
+        Out.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+        Out.ReplaceInline(TEXT("\""), TEXT("\\\""));
+        Out.ReplaceInline(TEXT("\r"), TEXT("\\r"));
+        Out.ReplaceInline(TEXT("\n"), TEXT("\\n"));
+        return Out;
+    }
+
+    static bool TryResolveDefaultValueToCppExpr(const UEdGraphPin* InPin, FString& OutExpr)
+    {
+        if (!InPin)
+        {
+            return false;
+        }
+
+        const FName& Cat = InPin->PinType.PinCategory;
+        const FString& Def = InPin->DefaultValue;
+
+        if (Cat == UEdGraphSchema_K2::PC_Boolean)
+        {
+            OutExpr = (Def.Equals(TEXT("true"), ESearchCase::IgnoreCase) || Def == TEXT("1")) ? TEXT("true") : TEXT("false");
+            return true;
+        }
+
+        if (Cat == UEdGraphSchema_K2::PC_Int ||
+            Cat == UEdGraphSchema_K2::PC_Int64 ||
+            Cat == UEdGraphSchema_K2::PC_Byte)
+        {
+            if (Def.IsEmpty())
+            {
+                OutExpr = TEXT("0");
+            }
+            else
+            {
+                OutExpr = Def;
+            }
+            return true;
+        }
+
+        if (Cat == UEdGraphSchema_K2::PC_Float)
+        {
+            FString V = Def.IsEmpty() ? TEXT("0.0") : Def;
+            if (!V.EndsWith(TEXT("f")) && !V.EndsWith(TEXT("F")))
+            {
+                V += TEXT("f");
+            }
+            OutExpr = V;
+            return true;
+        }
+
+        if (Cat == UEdGraphSchema_K2::PC_Double)
+        {
+            OutExpr = Def.IsEmpty() ? TEXT("0.0") : Def;
+            return true;
+        }
+
+        if (Cat == UEdGraphSchema_K2::PC_String)
+        {
+            OutExpr = FString::Printf(TEXT("TEXT(\"%s\")"), *EscapeStringLiteral(Def));
+            return true;
+        }
+
+        if (Cat == UEdGraphSchema_K2::PC_Name)
+        {
+            OutExpr = FString::Printf(TEXT("FName(TEXT(\"%s\"))"), *EscapeStringLiteral(Def));
+            return true;
+        }
+
+        if (Cat == UEdGraphSchema_K2::PC_Text)
+        {
+            OutExpr = FString::Printf(TEXT("FText::FromString(TEXT(\"%s\"))"), *EscapeStringLiteral(Def));
+            return true;
+        }
+
+        return false;
+    }
+
+    static bool TryResolveOutputPinToCppExpr(const UEdGraphPin* InOutputPin, FString& OutExpr)
+    {
+        if (!InOutputPin)
+        {
+            return false;
+        }
+
+        const UEdGraphNode* Node = InOutputPin->GetOwningNode();
+        if (const UK2Node_VariableGet* GetNode = Cast<UK2Node_VariableGet>(Node))
+        {
+            OutExpr = GetNode->VariableReference.GetMemberName().ToString();
+            return !OutExpr.IsEmpty();
+        }
+
+        return false;
+    }
+
+    static bool TryResolvePinToCppExpr(const UEdGraphPin* InPin, FString& OutExpr)
+    {
+        if (!InPin)
+        {
+            return false;
+        }
+
+        if (InPin->LinkedTo.Num() > 0 && InPin->LinkedTo[0])
+        {
+            return TryResolveOutputPinToCppExpr(InPin->LinkedTo[0], OutExpr);
+        }
+
+        return TryResolveDefaultValueToCppExpr(InPin, OutExpr);
+    }
+
     // Walks the linear chain starting at InStartNode, following the default exec then-pin.
     static void TraceLinearChain(const UEdGraphNode* InStartNode,
                                  int32 Depth,
                                  int32 MaxDepth,
                                  TSet<const UEdGraphNode*>& VisitedThisChain,
                                  TArray<TSharedPtr<FBPGraphNodeInfo>>& OutChain,
+                                  TArray<const UEdGraph*>& MacroGraphStack,
                                  int32& OutTotalCount,
                                  int32& OutUnsupportedCount)
     {
@@ -312,7 +492,7 @@ namespace BlueprintBusterParsers
             VisitedThisChain.Add(Current);
 
             TSharedPtr<FBPGraphNodeInfo> NodeInfo =
-                TraceNode(Current, Depth, MaxDepth, VisitedThisChain,
+                TraceNode(Current, Depth, MaxDepth, VisitedThisChain, MacroGraphStack,
                           OutTotalCount, OutUnsupportedCount);
             if (!NodeInfo.IsValid())
             {
@@ -329,7 +509,8 @@ namespace BlueprintBusterParsers
                 {
                     // For Branch/Sequence we hand off via dedicated traversal — bail here.
                     if (Current->IsA<UK2Node_IfThenElse>() ||
-                        Current->IsA<UK2Node_ExecutionSequence>())
+                        Current->IsA<UK2Node_ExecutionSequence>() ||
+                        Current->IsA<UK2Node_MacroInstance>())
                     {
                         NextPin = nullptr;
                         break;
@@ -348,6 +529,7 @@ namespace BlueprintBusterParsers
                                                   int32 Depth,
                                                   int32 MaxDepth,
                                                   TSet<const UEdGraphNode*>& VisitedThisChain,
+                                                  TArray<const UEdGraph*>& MacroGraphStack,
                                                   int32& OutTotalCount,
                                                   int32& OutUnsupportedCount)
     {
@@ -378,7 +560,82 @@ namespace BlueprintBusterParsers
             if (IsValid(TargetCls))
             {
                 Info->TargetClassPath = TargetCls->GetPathName();
+                Info->TargetClassName = TargetCls->GetName();
             }
+
+            UFunction* Func = CallNode->GetTargetFunction();
+            if (!Func)
+            {
+                Info->NodeKind          = TEXT("Unsupported");
+                Info->NodeLabel         = TEXT("UK2Node_CallFunction");
+                Info->UnsupportedReason = TEXT("CallFunction has no target UFunction");
+                ++OutUnsupportedCount;
+                return Info;
+            }
+
+            for (UEdGraphPin* Pin : CallNode->Pins)
+            {
+                if (Pin && Pin->Direction == EGPD_Output &&
+                    Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec &&
+                    Pin->PinName != UEdGraphSchema_K2::PN_ReturnValue)
+                {
+                    Info->NodeKind          = TEXT("Unsupported");
+                    Info->UnsupportedReason = TEXT("CallFunction out-parameters are not supported");
+                    ++OutUnsupportedCount;
+                    return Info;
+                }
+            }
+
+            const bool bIsStatic = Func->HasAnyFunctionFlags(FUNC_Static);
+            if (!bIsStatic)
+            {
+                UEdGraphPin* SelfPin = CallNode->FindPin(UEdGraphSchema_K2::PN_Self);
+                if (SelfPin && SelfPin->LinkedTo.Num() > 0)
+                {
+                    FString TargetExpr;
+                    if (!TryResolvePinToCppExpr(SelfPin, TargetExpr))
+                    {
+                        Info->NodeKind          = TEXT("Unsupported");
+                        Info->UnsupportedReason = TEXT("CallFunction target expression cannot be resolved");
+                        ++OutUnsupportedCount;
+                        return Info;
+                    }
+                    Info->TargetExpression = TargetExpr;
+                }
+                else
+                {
+                    Info->TargetExpression = TEXT("this");
+                }
+            }
+
+            for (TFieldIterator<FProperty> It(Func); It; ++It)
+            {
+                FProperty* Prop = *It;
+                if (!Prop || !Prop->HasAnyPropertyFlags(CPF_Parm))
+                {
+                    continue;
+                }
+                if (Prop->HasAnyPropertyFlags(CPF_ReturnParm))
+                {
+                    continue;
+                }
+
+                UEdGraphPin* ParamPin = CallNode->FindPin(Prop->GetFName());
+                FString Expr;
+                if (!TryResolvePinToCppExpr(ParamPin, Expr))
+                {
+                    Info->NodeKind          = TEXT("Unsupported");
+                    Info->UnsupportedReason = FString::Printf(TEXT("CallFunction argument '%s' cannot be resolved"), *Prop->GetName());
+                    ++OutUnsupportedCount;
+                    return Info;
+                }
+
+                FBPCallArgumentInfo Arg;
+                Arg.Name = Prop->GetName();
+                Arg.Expr = Expr;
+                Info->CallArguments.Add(MoveTemp(Arg));
+            }
+
             return Info;
         }
 
@@ -388,6 +645,16 @@ namespace BlueprintBusterParsers
             Info->NodeKind  = TEXT("Branch");
             Info->NodeLabel = TEXT("Branch");
 
+            FString CondExpr;
+            if (!TryResolvePinToCppExpr(BranchNode->GetConditionPin(), CondExpr))
+            {
+                Info->NodeKind          = TEXT("Unsupported");
+                Info->UnsupportedReason = TEXT("Branch condition cannot be resolved");
+                ++OutUnsupportedCount;
+                return Info;
+            }
+            Info->ConditionExpression = CondExpr;
+
             // Find Then / Else pins by name (UE convention).
             const UEdGraphPin* ThenPin = BranchNode->GetThenPin();
             const UEdGraphPin* ElsePin = BranchNode->GetElsePin();
@@ -395,12 +662,12 @@ namespace BlueprintBusterParsers
             if (const UEdGraphNode* ThenNext = GetLinkedExecNode(ThenPin))
             {
                 TraceLinearChain(ThenNext, Depth + 1, MaxDepth, VisitedThisChain,
-                                 Info->BranchTrue, OutTotalCount, OutUnsupportedCount);
+                                 Info->BranchTrue, MacroGraphStack, OutTotalCount, OutUnsupportedCount);
             }
             if (const UEdGraphNode* ElseNext = GetLinkedExecNode(ElsePin))
             {
                 TraceLinearChain(ElseNext, Depth + 1, MaxDepth, VisitedThisChain,
-                                 Info->BranchFalse, OutTotalCount, OutUnsupportedCount);
+                                 Info->BranchFalse, MacroGraphStack, OutTotalCount, OutUnsupportedCount);
             }
             return Info;
         }
@@ -419,7 +686,7 @@ namespace BlueprintBusterParsers
                     if (const UEdGraphNode* SeqNext = GetLinkedExecNode(Pin))
                     {
                         TraceLinearChain(SeqNext, Depth + 1, MaxDepth, VisitedThisChain,
-                                         Info->Next, OutTotalCount, OutUnsupportedCount);
+                                         Info->Next, MacroGraphStack, OutTotalCount, OutUnsupportedCount);
                     }
                 }
             }
@@ -437,18 +704,66 @@ namespace BlueprintBusterParsers
         {
             Info->NodeKind  = TEXT("VariableSet");
             Info->NodeLabel = SetNode->VariableReference.GetMemberName().ToString();
+            FString ValueExpr;
+            if (!TryResolvePinToCppExpr(SetNode->GetValuePin(), ValueExpr))
+            {
+                Info->NodeKind          = TEXT("Unsupported");
+                Info->UnsupportedReason = TEXT("VariableSet value cannot be resolved");
+                ++OutUnsupportedCount;
+                return Info;
+            }
+            Info->ValueExpression = ValueExpr;
             return Info;
         }
 
         // Macro instance — translator cannot expand; mark for manual review.
         if (const UK2Node_MacroInstance* MacroNode = Cast<UK2Node_MacroInstance>(InNode))
         {
-            Info->NodeKind         = TEXT("MacroInstance");
-            Info->NodeLabel        = MacroNode->GetMacroGraph()
-                ? MacroNode->GetMacroGraph()->GetName()
-                : TEXT("UnknownMacro");
-            Info->UnsupportedReason = TEXT("Macro nodes require manual expansion to C++");
-            ++OutUnsupportedCount;
+            const UEdGraph* MacroGraph = MacroNode->GetMacroGraph();
+            if (!IsValid(MacroGraph))
+            {
+                Info->NodeKind          = TEXT("Unsupported");
+                Info->NodeLabel         = TEXT("UK2Node_MacroInstance");
+                Info->UnsupportedReason = TEXT("Macro instance has no MacroGraph");
+                ++OutUnsupportedCount;
+                return Info;
+            }
+
+            if (MacroGraphStack.Contains(MacroGraph))
+            {
+                Info->NodeKind          = TEXT("Unsupported");
+                Info->NodeLabel         = MacroGraph->GetName();
+                Info->UnsupportedReason = TEXT("Macro recursion detected during dump");
+                ++OutUnsupportedCount;
+                return Info;
+            }
+
+            Info->NodeKind  = TEXT("FunctionEntry");
+            Info->NodeLabel = MacroGraph->GetName();
+
+            MacroGraphStack.Add(MacroGraph);
+            const UEdGraphNode* MacroStart = FindMacroEntryExecNode(MacroGraph);
+            if (MacroStart)
+            {
+                TSet<const UEdGraphNode*> MacroVisited;
+                TraceLinearChain(MacroStart, Depth + 1, MaxDepth, MacroVisited,
+                                 Info->Next, MacroGraphStack, OutTotalCount, OutUnsupportedCount);
+            }
+            else
+            {
+                ++OutUnsupportedCount;
+                Info->NodeKind = TEXT("Unsupported");
+                Info->UnsupportedReason = TEXT("Macro entry tunnel has no linked exec output");
+                MacroGraphStack.Pop();
+                return Info;
+            }
+            MacroGraphStack.Pop();
+
+            if (const UEdGraphNode* AfterMacro = GetFirstLinkedExecFromNode(MacroNode))
+            {
+                TraceLinearChain(AfterMacro, Depth + 1, MaxDepth, VisitedThisChain,
+                                 Info->Next, MacroGraphStack, OutTotalCount, OutUnsupportedCount);
+            }
             return Info;
         }
 
@@ -502,7 +817,8 @@ namespace BlueprintBusterParsers
                 Tree.GraphName = Graph->GetName();
 
                 TSet<const UEdGraphNode*> Visited;
-                Tree.EventRoot = TraceNode(EventNode, /*Depth=*/0, MaxDepth, Visited,
+                TArray<const UEdGraph*> MacroGraphStack;
+                Tree.EventRoot = TraceNode(EventNode, /*Depth=*/0, MaxDepth, Visited, MacroGraphStack,
                                             OutTotalNodeCount, OutUnsupportedCount);
 
                 // Trace the rest of the linear chain from the event's Then pin.
@@ -517,6 +833,7 @@ namespace BlueprintBusterParsers
                             {
                                 TraceLinearChain(Next, /*Depth=*/1, MaxDepth, Visited,
                                                  Tree.EventRoot->Next,
+                                                 MacroGraphStack,
                                                  OutTotalNodeCount, OutUnsupportedCount);
                             }
                             break;
@@ -791,12 +1108,14 @@ namespace BlueprintBusterParsers
             Func.FunctionRoot->NodeKind  = TEXT("FunctionEntry");
             Func.FunctionRoot->NodeLabel = Func.FunctionName;
 
+            TArray<const UEdGraph*> MacroGraphStack;
             if (const UEdGraphNode* FirstBodyNode = GetLinkedExecNode(ThenPin))
             {
                 TSet<const UEdGraphNode*> Visited;
                 Visited.Add(EntryNode);
                 TraceLinearChain(FirstBodyNode, /*Depth=*/1, MaxDepth, Visited,
                                  Func.FunctionRoot->Next,
+                                 MacroGraphStack,
                                  OutTotalNodeCount, OutUnsupportedCount);
             }
 

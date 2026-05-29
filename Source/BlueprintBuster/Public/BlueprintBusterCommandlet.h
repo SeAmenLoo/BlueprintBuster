@@ -39,11 +39,13 @@ private:
     // Returns true on success.
     bool ProcessBlueprint(const FString& InBlueprintPath,
                            const FString& InOutputDir,
-                           int32 InMaxDepth) const;
+                           int32 InMaxDepth,
+                           bool bFullDump) const;
 
     // Locates every blueprint under InDirectoryPath using the AssetRegistry and
     // hands each one to ProcessBlueprint. Returns the number of successes.
     int32 ProcessDirectory(const FString& InDirectoryPath,
                             const FString& InOutputDir,
-                            int32 InMaxDepth) const;
+                            int32 InMaxDepth,
+                            bool bFullDump) const;
 };

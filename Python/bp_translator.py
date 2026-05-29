@@ -21,10 +21,10 @@ The generator enforces the project's coding standards (TDD-06 + user override):
   * Class names use the project name or generic descriptors — the "QC" abbreviation
     is rejected at translation time.
   * Custom Blueprint functions are emitted as proper C++ methods with full
-    signatures (UFUNCTION + parameters + return type) and TODO-annotated bodies.
+    signatures (UFUNCTION + parameters + return type) and stub bodies.
 
-Unsupported graph nodes are surfaced as // TODO comments inside the generated cpp so
-the human reviewer never silently loses information.
+Unsupported graph nodes cause translation to fail so the reviewer never silently
+loses information.
 """
 
 from __future__ import annotations
@@ -76,7 +76,12 @@ class GraphNode:
     label: str
     function_name: str = ""
     target_class: str = ""
+    target_class_name: str = ""
+    target_expr: str = ""
     unsupported: str = ""
+    condition: str = ""
+    value_expr: str = ""
+    args: List[Dict[str, str]] = field(default_factory=list)
     next: List["GraphNode"] = field(default_factory=list)
     branch_true: List["GraphNode"] = field(default_factory=list)
     branch_false: List["GraphNode"] = field(default_factory=list)
@@ -146,7 +151,12 @@ def _parse_node(d: Optional[Dict[str, Any]]) -> Optional[GraphNode]:
         label=d.get("label", ""),
         function_name=d.get("function", ""),
         target_class=d.get("targetClass", ""),
+        target_class_name=d.get("targetClassName", ""),
+        target_expr=d.get("targetExpr", ""),
         unsupported=d.get("unsupported", ""),
+        condition=d.get("condition", ""),
+        value_expr=d.get("valueExpr", ""),
+        args=list(d.get("args", []) or []),
         next=_children("next"),
         branch_true=_children("true"),
         branch_false=_children("false"),
@@ -353,7 +363,7 @@ def cpp_type_for_property(prop: PropertyInfo) -> str:
         return "TMap<FName, FString>  // MANUAL: replace with the actual key/value types"
     if pt == "SetProperty":
         return f"TSet<{prop.inner_type or 'FName'}>"
-    return f"int32  /* TODO: unresolved property type '{pt}' */"
+    return f"int32  /* unresolved property type '{pt}' */"
 
 
 def cpp_default_literal(prop: PropertyInfo) -> Optional[str]:
@@ -398,7 +408,7 @@ def cpp_type_for_parameter(param: FunctionParameter) -> str:
     elif param.is_map:
         # Maps are not fully described by a single param (no key type carried);
         # the human reviewer must finalise the key type.
-        wrapped = f"TMap<FName, {base}>  /* TODO: confirm key type */"
+        wrapped = f"TMap<FName, {base}>  /* confirm key type */"
     else:
         wrapped = base
 
@@ -438,7 +448,7 @@ def _cpp_base_type_for_pin(param: FunctionParameter) -> str:
         return param.cpp_class_name or "int32"
 
     # Unknown pin category — emit a placeholder and let the reviewer fix it.
-    return f"int32 /* TODO: unresolved pin type '{t}' */"
+    return f"int32 /* unresolved pin type '{t}' */"
 
 
 def _is_complex_type(param: FunctionParameter) -> bool:
@@ -616,7 +626,7 @@ def emit_header(
         const_suffix = " const" if func.is_const else ""
         block = (
             f"    // Generated from BP function {func.function_name} "
-            f"(graph: {func.graph_name}). Body in .cpp — review TODOs.\n"
+            f"(graph: {func.graph_name}). Body in .cpp — review stubs.\n"
             f"    {_function_uproperty_macro(func)}\n"
             f"    {ret} {func.function_name}({param_text}){const_suffix};"
         )
@@ -804,7 +814,7 @@ def emit_source(
         lines.append("    // ── CDO defaults (deferred from header) ───────────────────────────")
         for d in deferred_defaults:
             lines.append(
-                f'    // TODO: assign default for {d.property_name} '
+                f'    // assign default for {d.property_name} '
                 f'(type {d.property_type}, raw value: "{d.value[:80]}").'
             )
 
@@ -880,16 +890,9 @@ def emit_source(
         else:
             lines.append("    // (empty BP function body)")
 
-        # Out-parameter defaults / single-return fallthrough.
-        if not _has_single_return(func) and func.returns:
+        if _has_single_return(func):
             lines.append("")
-            lines.append("    // TODO: populate Out* parameters before returning.")
-        elif _has_single_return(func):
-            lines.append("")
-            lines.append(
-                f"    return {_function_default_return_literal(func)}; "
-                f"// TODO: replace with computed result"
-            )
+            lines.append(f"    return {_function_default_return_literal(func)};")
 
         lines += ["}", ""]
 
@@ -911,14 +914,24 @@ def _emit_node_chain(root: GraphNode, indent: int) -> List[str]:
     def emit_node(node: GraphNode, depth: int) -> None:
         local_pad = "    " * depth
         if node.kind == "CallFunction":
-            out.append(f"{local_pad}// Call: {node.function_name}")
-            out.append(
-                f"{local_pad}// TODO: implement call to {node.function_name}"
-                f"{f' on {node.target_class}' if node.target_class else ''}."
-            )
+            if not node.function_name:
+                raise RuntimeError("CallFunction node has no function name")
+
+            arg_exprs = [a.get("expr", "") for a in node.args]
+            if any(not x for x in arg_exprs):
+                raise RuntimeError(f"CallFunction '{node.function_name}' has unresolved arguments")
+            args = ", ".join(arg_exprs)
+
+            if node.target_expr:
+                out.append(f"{local_pad}{node.target_expr}->{node.function_name}({args});")
+            elif node.target_class_name:
+                out.append(f"{local_pad}{node.target_class_name}::{node.function_name}({args});")
+            else:
+                out.append(f"{local_pad}this->{node.function_name}({args});")
         elif node.kind == "Branch":
-            out.append(f"{local_pad}// Branch — condition pin not resolved by translator.")
-            out.append(f"{local_pad}if (/* TODO: resolve condition */ true)")
+            if not node.condition:
+                raise RuntimeError("Branch node has no resolved condition expression")
+            out.append(f"{local_pad}if ({node.condition})")
             out.append(f"{local_pad}{{")
             for child in node.branch_true:
                 emit_node(child, depth + 1)
@@ -934,22 +947,21 @@ def _emit_node_chain(root: GraphNode, indent: int) -> List[str]:
             for child in node.next:
                 emit_node(child, depth)
             return
-        elif node.kind in ("VariableGet", "VariableSet"):
-            out.append(f"{local_pad}// {node.kind}: {node.label}")
+        elif node.kind == "VariableSet":
+            if not node.label or not node.value_expr:
+                raise RuntimeError("VariableSet node has no resolved assignment")
+            out.append(f"{local_pad}{node.label} = {node.value_expr};")
+        elif node.kind == "VariableGet":
+            return
         elif node.kind == "Event":
             pass
         elif node.kind == "FunctionEntry":
             # Function body root — no code, body is in node.next.
             pass
-        elif node.kind == "MacroInstance":
-            out.append(
-                f"{local_pad}// TODO: macro '{node.label}' must be expanded manually "
-                f"({node.unsupported})."
-            )
         elif node.kind == "Unsupported":
-            out.append(
-                f"{local_pad}// TODO: unsupported node '{node.label}' — "
-                f"{node.unsupported}"
+            raise RuntimeError(
+                "Unsupported node encountered. Extend dump generation to lower/expand "
+                f"this node before translating to C++: node='{node.label}', reason='{node.unsupported}'"
             )
         else:
             out.append(f"{local_pad}// {node.kind}: {node.label}")

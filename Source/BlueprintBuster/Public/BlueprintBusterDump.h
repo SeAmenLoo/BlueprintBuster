@@ -9,6 +9,6 @@ namespace BlueprintBusterDump
 {
 	FString GetDefaultDumpDirectory();
 	FString MakeDumpFilePath(const FString& OutputDir, const UBlueprint* Blueprint);
-	bool DumpBlueprintToJsonFile(UBlueprint* Blueprint, const FString& OutputFilePath, int32 MaxDepth, FBPDumpData* OutDump = nullptr);
+	bool DumpBlueprintToJsonFile(UBlueprint* Blueprint, const FString& OutputFilePath, int32 MaxDepth, FBPDumpData* OutDump = nullptr, bool bFailOnUnsupported = false);
 }
 

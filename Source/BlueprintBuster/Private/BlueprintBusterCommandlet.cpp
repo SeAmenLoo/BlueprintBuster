@@ -40,6 +40,7 @@ int32 UBlueprintBusterCommandlet::Main(const FString& Params)
     const FString* TargetDir = ParamValues.Find(TEXT("TargetDir"));
     const FString* OutputDir = ParamValues.Find(TEXT("OutputDir"));
     const FString* MaxDepthS = ParamValues.Find(TEXT("MaxDepth"));
+    const bool bFullDump = Switches.Contains(TEXT("FullDump")) || ParamValues.Contains(TEXT("FullDump"));
 
     const FString OutputDirValue = OutputDir ? *OutputDir : BlueprintBusterDump::GetDefaultDumpDirectory();
 
@@ -84,14 +85,14 @@ int32 UBlueprintBusterCommandlet::Main(const FString& Params)
     int32 Successes = 0;
     if (!TargetBPValue.IsEmpty())
     {
-        if (ProcessBlueprint(TargetBPValue, OutputDirValue, MaxDepth))
+        if (ProcessBlueprint(TargetBPValue, OutputDirValue, MaxDepth, bFullDump))
         {
             Successes++;
         }
     }
     else if (!TargetDirValue.IsEmpty())
     {
-        Successes = ProcessDirectory(TargetDirValue, OutputDirValue, MaxDepth);
+        Successes = ProcessDirectory(TargetDirValue, OutputDirValue, MaxDepth, bFullDump);
     }
 
     UE_LOG(LogBlueprintBuster, Display,
@@ -103,7 +104,8 @@ int32 UBlueprintBusterCommandlet::Main(const FString& Params)
 
 bool UBlueprintBusterCommandlet::ProcessBlueprint(const FString& InBlueprintPath,
                                                    const FString& InOutputDir,
-                                                   int32 InMaxDepth) const
+                                                   int32 InMaxDepth,
+                                                   bool bFullDump) const
 {
     UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *InBlueprintPath);
     if (!IsValid(Blueprint))
@@ -117,7 +119,7 @@ bool UBlueprintBusterCommandlet::ProcessBlueprint(const FString& InBlueprintPath
     const FString OutPath = BlueprintBusterDump::MakeDumpFilePath(InOutputDir, Blueprint);
 
     FBPDumpData Dump;
-    if (!BlueprintBusterDump::DumpBlueprintToJsonFile(Blueprint, OutPath, InMaxDepth, &Dump))
+    if (!BlueprintBusterDump::DumpBlueprintToJsonFile(Blueprint, OutPath, InMaxDepth, &Dump, bFullDump))
     {
         UE_LOG(LogBlueprintBuster, Error,
                TEXT("Failed to write dump for '%s' to '%s'"),
@@ -137,7 +139,8 @@ bool UBlueprintBusterCommandlet::ProcessBlueprint(const FString& InBlueprintPath
 
 int32 UBlueprintBusterCommandlet::ProcessDirectory(const FString& InDirectoryPath,
                                                     const FString& InOutputDir,
-                                                    int32 InMaxDepth) const
+                                                    int32 InMaxDepth,
+                                                    bool bFullDump) const
 {
     FAssetRegistryModule& AssetRegistryModule =
         FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
@@ -161,7 +164,7 @@ int32 UBlueprintBusterCommandlet::ProcessDirectory(const FString& InDirectoryPat
     for (const FAssetData& Asset : Assets)
     {
         const FString ObjectPath = Asset.GetObjectPathString();
-        if (ProcessBlueprint(ObjectPath, InOutputDir, InMaxDepth))
+        if (ProcessBlueprint(ObjectPath, InOutputDir, InMaxDepth, bFullDump))
         {
             Successes++;
         }

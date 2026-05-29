@@ -90,6 +90,8 @@ int32 UBlueprintBusterConvertCommandlet::Main(const FString& Params)
 		}
 	}
 
+	const bool bFullDump = Switches.Contains(TEXT("FullDump")) || ParamValues.Contains(TEXT("FullDump"));
+
 	if (!Target && !TargetBP && !TargetDir)
 	{
 		UE_LOG(LogBlueprintBuster, Error, TEXT("Provide -Target, -TargetBP or -TargetDir."));
@@ -137,9 +139,16 @@ int32 UBlueprintBusterConvertCommandlet::Main(const FString& Params)
 		}
 
 		const FString DumpFilePath = BlueprintBusterDump::MakeDumpFilePath(DumpDir, Blueprint);
-		if (!BlueprintBusterDump::DumpBlueprintToJsonFile(Blueprint, DumpFilePath, MaxDepth))
+		if (!BlueprintBusterDump::DumpBlueprintToJsonFile(Blueprint, DumpFilePath, MaxDepth, nullptr, bFullDump))
 		{
-			UE_LOG(LogBlueprintBuster, Error, TEXT("Dump failed for '%s'"), *Blueprint->GetName());
+			if (bFullDump)
+			{
+				UE_LOG(LogBlueprintBuster, Error, TEXT("FullDump failed for '%s' (unsupported nodes remain). JSON still written: %s"), *Blueprint->GetName(), *DumpFilePath);
+			}
+			else
+			{
+				UE_LOG(LogBlueprintBuster, Error, TEXT("Dump failed for '%s'"), *Blueprint->GetName());
+			}
 			continue;
 		}
 

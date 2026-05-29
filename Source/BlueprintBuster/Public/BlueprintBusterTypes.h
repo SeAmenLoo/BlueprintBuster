@@ -68,6 +68,12 @@ struct FBPPropertyInfo
 
 // ─── Graph node entry ─────────────────────────────────────────────────────────
 
+struct FBPCallArgumentInfo
+{
+    FString Name;
+    FString Expr;
+};
+
 struct FBPGraphNodeInfo
 {
     // Short logical type: "Event", "CallFunction", "Branch", "Sequence",
@@ -82,6 +88,21 @@ struct FBPGraphNodeInfo
 
     // For CallFunction — the owning class path (empty == Self).
     FString TargetClassPath;
+
+    // For CallFunction — owning class name (e.g. "UKismetSystemLibrary").
+    FString TargetClassName;
+
+    // For CallFunction — resolved call target expression ("this", "OtherActor", ...).
+    FString TargetExpression;
+
+    // For CallFunction — resolved argument expressions in signature order.
+    TArray<FBPCallArgumentInfo> CallArguments;
+
+    // For Branch — resolved condition expression.
+    FString ConditionExpression;
+
+    // For VariableSet — resolved value expression for the variable assignment.
+    FString ValueExpression;
 
     // Successor nodes via the default Then/Exec pin.
     TArray<TSharedPtr<FBPGraphNodeInfo>> Next;

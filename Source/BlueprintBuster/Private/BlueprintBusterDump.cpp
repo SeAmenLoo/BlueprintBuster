@@ -34,9 +34,39 @@ namespace
 		{
 			Obj->SetStringField(TEXT("targetClass"), InNode->TargetClassPath);
 		}
+		if (!InNode->TargetClassName.IsEmpty())
+		{
+			Obj->SetStringField(TEXT("targetClassName"), InNode->TargetClassName);
+		}
+		if (!InNode->TargetExpression.IsEmpty())
+		{
+			Obj->SetStringField(TEXT("targetExpr"), InNode->TargetExpression);
+		}
+		if (!InNode->ConditionExpression.IsEmpty())
+		{
+			Obj->SetStringField(TEXT("condition"), InNode->ConditionExpression);
+		}
+		if (!InNode->ValueExpression.IsEmpty())
+		{
+			Obj->SetStringField(TEXT("valueExpr"), InNode->ValueExpression);
+		}
 		if (!InNode->UnsupportedReason.IsEmpty())
 		{
 			Obj->SetStringField(TEXT("unsupported"), InNode->UnsupportedReason);
+		}
+
+		if (InNode->CallArguments.Num() > 0)
+		{
+			TArray<TSharedPtr<FJsonValue>> Args;
+			Args.Reserve(InNode->CallArguments.Num());
+			for (const FBPCallArgumentInfo& Arg : InNode->CallArguments)
+			{
+				TSharedRef<FJsonObject> A = MakeShared<FJsonObject>();
+				A->SetStringField(TEXT("name"), Arg.Name);
+				A->SetStringField(TEXT("expr"), Arg.Expr);
+				Args.Add(MakeShared<FJsonValueObject>(A));
+			}
+			Obj->SetArrayField(TEXT("args"), Args);
 		}
 
 		auto SerialiseList = [&](const TArray<TSharedPtr<FBPGraphNodeInfo>>& InList, const FString& Field)
@@ -208,7 +238,7 @@ FString BlueprintBusterDump::MakeDumpFilePath(const FString& OutputDir, const UB
 	return FPaths::Combine(BaseDir, FileName);
 }
 
-bool BlueprintBusterDump::DumpBlueprintToJsonFile(UBlueprint* Blueprint, const FString& OutputFilePath, int32 MaxDepth, FBPDumpData* OutDump)
+bool BlueprintBusterDump::DumpBlueprintToJsonFile(UBlueprint* Blueprint, const FString& OutputFilePath, int32 MaxDepth, FBPDumpData* OutDump, bool bFailOnUnsupported)
 {
 	if (!IsValid(Blueprint))
 	{
@@ -250,6 +280,10 @@ bool BlueprintBusterDump::DumpBlueprintToJsonFile(UBlueprint* Blueprint, const F
 	if (OutDump)
 	{
 		*OutDump = MoveTemp(Dump);
+	}
+	if (bFailOnUnsupported)
+	{
+		return Dump.UnsupportedNodeCount == 0;
 	}
 	return true;
 }
