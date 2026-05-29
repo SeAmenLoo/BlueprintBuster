@@ -167,7 +167,18 @@ def _parse_parameter(d: Dict[str, Any]) -> FunctionParameter:
 
 
 def load_dump(path: Path) -> DumpData:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    data = path.read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        text = data.decode("utf-8-sig")
+    elif data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        text = data.decode("utf-16")
+    else:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = data.decode("utf-16")
+
+    raw = json.loads(text)
 
     components = [
         ComponentInfo(

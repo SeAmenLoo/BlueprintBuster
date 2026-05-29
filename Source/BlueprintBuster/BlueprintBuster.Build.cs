@@ -29,6 +29,8 @@ public class BlueprintBuster : ModuleRules
             "KismetCompiler",
             "AssetRegistry",
             "AssetTools",
+            "ContentBrowser",
+            "DesktopPlatform",
             "EditorSubsystem",
             "Slate",
             "SlateCore",

@@ -248,7 +248,7 @@ The translator rejects generation of classes whose name contains a forbidden sub
     -run=BlueprintBuster ^
     -Plugin="<YourProject>\Plugins\BlueprintBuster\BlueprintBuster.uplugin" ^
     -TargetDir="/Game/Blueprints/MySystem" ^
-    -OutputDir="<DumpsDir>" ^
+    [-OutputDir="<DumpsDir>"] ^
     -NoUI
 ```
 
@@ -260,7 +260,8 @@ Parameters:
 | `<YourProject>` | Absolute path to the UE project root |
 | `-TargetDir` | Virtual Content Browser path (`/Game/...`) for recursive scanning |
 | `-TargetBP` | Alternative to `-TargetDir`: path to a single asset (`/Game/Path/To/BP_Foo`, without `.uasset` or `_C`) |
-| `-OutputDir` | Absolute filesystem path where `*_dump.json` files are written |
+| `-Target` | Unified target: `/Game/...BP.BP` for a single asset, otherwise treated as a folder |
+| `-OutputDir` | Absolute filesystem path where `*_dump.json` files are written (default: `<Project>/Saved/BlueprintBuster/Dumps`) |
 | `-MaxDepth` | Maximum graph tracing depth (default: `64`) |
 
 Result: files like `BP_MyActor_dump.json` will appear in `<DumpsDir>`.
@@ -301,6 +302,23 @@ Get-ChildItem -Path "<DumpsDir>" -Filter "*_dump.json" | ForEach-Object {
     python $Translator $_.FullName -o $OutDir --module-api $Api
 }
 ```
+
+### 4.5. One-shot conversion (Blueprint → JSON → C++)
+
+```bat
+"<UE_INSTALL>\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" ^
+    "<YourProject>\<YourProject>.uproject" ^
+    -run=BlueprintBusterConvert ^
+    -Plugin="<YourProject>\Plugins\BlueprintBuster\BlueprintBuster.uplugin" ^
+    -Target="/Game/Blueprints/BP_MyActor.BP_MyActor" ^
+    -NoUI
+```
+
+### 4.6. Editor menu entry
+
+When enabled, use:
+- Tools → BlueprintBuster: Dump Selected Blueprints to JSON
+- Tools → BlueprintBuster: Convert Selected Blueprints to C++
 
 ---
 

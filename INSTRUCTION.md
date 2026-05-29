@@ -59,8 +59,8 @@ All examples use the `-Plugin=` flag with a **direct absolute path** to `.uplugi
     "<AbsolutePathToUProject>" ^
     -run=BlueprintBuster ^
     -Plugin="<AbsolutePathToBlueprintBuster.uplugin>" ^
-    [-TargetBP="/Game/Path/To/BP_Foo"  | -TargetDir="/Game/Path"] ^
-    -OutputDir="<AbsolutePathToDumpsDir>" ^
+    [-Target="/Game/Path/To/BP_Foo.BP_Foo" | -TargetBP="/Game/Path/To/BP_Foo"  | -TargetDir="/Game/Path"] ^
+    [-OutputDir="<AbsolutePathToDumpsDir>"] ^
     [-MaxDepth=64] ^
     [-Verbose] ^
     -NoUI
@@ -71,9 +71,10 @@ Parameters:
 | Key | Required | Purpose |
 | --- | --- | --- |
 | `-Plugin=` | **required** | absolute path to `BlueprintBuster.uplugin` (lets UE load the module without editing `.uproject`) |
+| `-Target=` | optional | unified target; if it contains a dot (`/Game/...BP.BP`) it is treated as a single Blueprint object path, otherwise as a folder |
 | `-TargetBP=` | mutually exclusive with `-TargetDir` | path to a single Blueprint as `/Game/...` (WITHOUT extension and WITHOUT `_C` suffix) |
 | `-TargetDir=` | mutually exclusive with `-TargetBP` | root folder for recursive Blueprint search |
-| `-OutputDir=` | **required** | absolute filesystem path where `*_dump.json` files are saved |
+| `-OutputDir=` | optional | absolute filesystem path where `*_dump.json` files are saved (default: `<Project>/Saved/BlueprintBuster/Dumps`) |
 | `-MaxDepth=` | optional, default 64 | maximum graph traversal depth |
 | `-Verbose` | optional | verbose log per Blueprint |
 | `-NoUI` | recommended | disables all Editor UI windows — required for headless runs |
@@ -138,6 +139,40 @@ In CI it is recommended to check the return code and parse `LogBlueprintBuster` 
 - **`Could not find module 'BlueprintBuster'`** — the plugin has not been built. Run `Generate Visual Studio project files` and rebuild the `Development Editor | Win64` configuration.
 
 ---
+
+## 3. One-shot conversion (Blueprint → JSON → C++)
+
+This commandlet runs the JSON dump and then calls the bundled `Python/bp_translator.py` for each dumped blueprint.
+
+```
+"<UE_INSTALL>\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" ^
+    "<AbsolutePathToUProject>" ^
+    -run=BlueprintBusterConvert ^
+    -Plugin="<AbsolutePathToBlueprintBuster.uplugin>" ^
+    -Target="/Game/Blueprints/BP_Foo.BP_Foo" ^
+    [-DumpDir="<AbsolutePathToJsonDir>"] ^
+    [-CppDir="<AbsolutePathToCppDir>"] ^
+    [-Python="python"] ^
+    [-ModuleAPI="YOURMODULE_API"] ^
+    [-MaxDepth=64] ^
+    -NoUI
+```
+
+Notes:
+- `-DumpDir` defaults to `<Project>/Saved/BlueprintBuster/Dumps`.
+- `-CppDir` defaults to `<Project>/Saved/BlueprintBuster/Cpp`.
+- `-Python` defaults to `python` (must be available in PATH).
+- `-ModuleAPI` defaults to `<PROJECTNAME>_API`.
+
+---
+
+## 4. Editor menu entry
+
+When the plugin is enabled, open the Editor and use:
+- **Tools → BlueprintBuster: Dump Selected Blueprints to JSON**
+- **Tools → BlueprintBuster: Convert Selected Blueprints to C++**
+
+Both actions operate on the current Content Browser selection.
 
 ## 3. Running the Python Translator
 
