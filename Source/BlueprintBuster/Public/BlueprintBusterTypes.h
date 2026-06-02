@@ -98,11 +98,22 @@ struct FBPGraphNodeInfo
     // For CallFunction — resolved argument expressions in signature order.
     TArray<FBPCallArgumentInfo> CallArguments;
 
+    FString AssignToVariable;
+
     // For Branch — resolved condition expression.
     FString ConditionExpression;
 
     // For VariableSet — resolved value expression for the variable assignment.
     FString ValueExpression;
+
+    // For AddDelegate — delegate property name on the target object.
+    FString DelegatePropertyName;
+
+    // For AddDelegate — bound function name (must be a method on "this" for now).
+    FString DelegateHandlerFunctionName;
+
+    // For FlipFlop — generated state variable name.
+    FString FlipFlopStateVarName;
 
     // Successor nodes via the default Then/Exec pin.
     TArray<TSharedPtr<FBPGraphNodeInfo>> Next;
@@ -114,7 +125,7 @@ struct FBPGraphNodeInfo
     TArray<TSharedPtr<FBPGraphNodeInfo>> BranchFalse;
 
     // If the translator cannot emit C++ for this node, the reason goes here so
-    // the generated TODO carries useful information to the human reviewer.
+    // the generated error carries useful information to the human reviewer.
     FString UnsupportedReason;
 };
 

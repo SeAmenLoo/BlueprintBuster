@@ -23,10 +23,16 @@
 #include "K2Node_ExecutionSequence.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
+#include "K2Node_EnumLiteral.h"
+#include "K2Node_Knot.h"
+#include "K2Node_MakeArray.h"
 #include "K2Node_MacroInstance.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
+#include "K2Node_Select.h"
 #include "K2Node_Tunnel.h"
+#include "K2Node_AddDelegate.h"
+#include "K2Node_CreateDelegate.h"
 #include "UObject/Class.h"
 #include "UObject/FieldIterator.h"
 #include "UObject/UnrealNames.h"
@@ -370,15 +376,214 @@ namespace BlueprintBusterParsers
         return Out;
     }
 
-    static bool TryResolveDefaultValueToCppExpr(const UEdGraphPin* InPin, FString& OutExpr)
+    static FString NormaliseFloatLiteral(FString In)
     {
-        if (!InPin)
+        In.TrimStartAndEndInline();
+        if (In.IsEmpty())
+        {
+            return TEXT("0.0f");
+        }
+        if (In.EndsWith(TEXT("f")) || In.EndsWith(TEXT("F")))
+        {
+            return In;
+        }
+        if (!In.Contains(TEXT(".")) && !In.Contains(TEXT("e")) && !In.Contains(TEXT("E")))
+        {
+            In += TEXT(".0");
+        }
+        In += TEXT("f");
+        return In;
+    }
+
+    static bool ParseStructDefaultPairs(const FString& InDefault, TMap<FString, FString>& OutPairs)
+    {
+        OutPairs.Reset();
+        FString S = InDefault;
+        S.TrimStartAndEndInline();
+        if (S.StartsWith(TEXT("(")) && S.EndsWith(TEXT(")")) && S.Len() >= 2)
+        {
+            S = S.Mid(1, S.Len() - 2);
+        }
+        if (S.IsEmpty())
         {
             return false;
         }
 
+        TArray<FString> Parts;
+        S.ParseIntoArray(Parts, TEXT(","), true);
+        for (FString Part : Parts)
+        {
+            Part.TrimStartAndEndInline();
+            FString Key;
+            FString Val;
+            if (!Part.Split(TEXT("="), &Key, &Val))
+            {
+                continue;
+            }
+            Key.TrimStartAndEndInline();
+            Val.TrimStartAndEndInline();
+            if (!Key.IsEmpty())
+            {
+                OutPairs.Add(Key, Val);
+            }
+        }
+        return OutPairs.Num() > 0;
+    }
+
+    static bool TryResolveStructDefaultToCppExpr(const UEdGraphPin* InPin, FString& OutExpr, FString& OutFailureReason)
+    {
+        const UScriptStruct* AsStruct = Cast<UScriptStruct>(InPin->PinType.PinSubCategoryObject.Get());
+        if (!AsStruct)
+        {
+            OutFailureReason = TEXT("Struct pin has no PinSubCategoryObject");
+            return false;
+        }
+
+        TMap<FString, FString> Pairs;
+        if (!ParseStructDefaultPairs(InPin->DefaultValue, Pairs))
+        {
+            OutFailureReason = TEXT("Struct pin has empty or unparseable default value");
+            return false;
+        }
+
+        const FString StructName = AsStruct->GetName();
+        if (StructName == TEXT("Vector"))
+        {
+            const FString* X = Pairs.Find(TEXT("X"));
+            const FString* Y = Pairs.Find(TEXT("Y"));
+            const FString* Z = Pairs.Find(TEXT("Z"));
+            if (!X || !Y || !Z)
+            {
+                OutFailureReason = TEXT("FVector default value is missing X/Y/Z");
+                return false;
+            }
+            OutExpr = FString::Printf(TEXT("FVector(%s, %s, %s)"), *NormaliseFloatLiteral(*X), *NormaliseFloatLiteral(*Y), *NormaliseFloatLiteral(*Z));
+            return true;
+        }
+        if (StructName == TEXT("LinearColor"))
+        {
+            const FString* R = Pairs.Find(TEXT("R"));
+            const FString* G = Pairs.Find(TEXT("G"));
+            const FString* B = Pairs.Find(TEXT("B"));
+            const FString* A = Pairs.Find(TEXT("A"));
+            if (!R || !G || !B || !A)
+            {
+                OutFailureReason = TEXT("FLinearColor default value is missing R/G/B/A");
+                return false;
+            }
+            OutExpr = FString::Printf(TEXT("FLinearColor(%s, %s, %s, %s)"), *NormaliseFloatLiteral(*R), *NormaliseFloatLiteral(*G), *NormaliseFloatLiteral(*B), *NormaliseFloatLiteral(*A));
+            return true;
+        }
+        if (StructName == TEXT("Rotator"))
+        {
+            const FString* Pitch = Pairs.Find(TEXT("Pitch"));
+            const FString* Yaw = Pairs.Find(TEXT("Yaw"));
+            const FString* Roll = Pairs.Find(TEXT("Roll"));
+            if (!Pitch || !Yaw || !Roll)
+            {
+                OutFailureReason = TEXT("FRotator default value is missing Pitch/Yaw/Roll");
+                return false;
+            }
+            OutExpr = FString::Printf(TEXT("FRotator(%s, %s, %s)"), *NormaliseFloatLiteral(*Pitch), *NormaliseFloatLiteral(*Yaw), *NormaliseFloatLiteral(*Roll));
+            return true;
+        }
+
+        OutFailureReason = FString::Printf(TEXT("Struct default value is not supported: %s"), *StructName);
+        return false;
+    }
+
+    static bool TryResolvePinTypeToCppType(const FEdGraphPinType& InPinType, FString& OutCppType)
+    {
+        const FName& Cat = InPinType.PinCategory;
+
+        if (Cat == UEdGraphSchema_K2::PC_Boolean) { OutCppType = TEXT("bool"); return true; }
+        if (Cat == UEdGraphSchema_K2::PC_Int)     { OutCppType = TEXT("int32"); return true; }
+        if (Cat == UEdGraphSchema_K2::PC_Int64)   { OutCppType = TEXT("int64"); return true; }
+        if (Cat == UEdGraphSchema_K2::PC_Float)   { OutCppType = TEXT("float"); return true; }
+        if (Cat == UEdGraphSchema_K2::PC_Double)  { OutCppType = TEXT("double"); return true; }
+        if (Cat == UEdGraphSchema_K2::PC_Real)
+        {
+            OutCppType = (InPinType.PinSubCategory == UEdGraphSchema_K2::PC_Double) ? TEXT("double") : TEXT("float");
+            return true;
+        }
+        if (Cat == UEdGraphSchema_K2::PC_String)  { OutCppType = TEXT("FString"); return true; }
+        if (Cat == UEdGraphSchema_K2::PC_Name)    { OutCppType = TEXT("FName"); return true; }
+        if (Cat == UEdGraphSchema_K2::PC_Text)    { OutCppType = TEXT("FText"); return true; }
+
+        if (Cat == UEdGraphSchema_K2::PC_Byte)
+        {
+            if (const UObject* SubObj = InPinType.PinSubCategoryObject.Get())
+            {
+                if (const UEnum* Enum = Cast<UEnum>(SubObj))
+                {
+                    OutCppType = Enum->GetName();
+                    return true;
+                }
+            }
+            OutCppType = TEXT("uint8");
+            return true;
+        }
+
+        if (Cat == UEdGraphSchema_K2::PC_Object ||
+            Cat == UEdGraphSchema_K2::PC_Interface)
+        {
+            const UObject* SubObj = InPinType.PinSubCategoryObject.Get();
+            const UClass* AsClass = Cast<UClass>(SubObj);
+            FString TypeName = AsClass ? AsClass->GetName() : FString();
+            if (TypeName.IsEmpty()) TypeName = TEXT("UObject");
+            if (AsClass && AsClass->IsChildOf(AActor::StaticClass()) && !TypeName.StartsWith(TEXT("A")))
+            {
+                TypeName = FString::Printf(TEXT("A%s"), *TypeName);
+            }
+            else if (!TypeName.StartsWith(TEXT("U")) && !TypeName.StartsWith(TEXT("A")))
+            {
+                TypeName = FString::Printf(TEXT("U%s"), *TypeName);
+            }
+            OutCppType = FString::Printf(TEXT("TObjectPtr<%s>"), *TypeName);
+            return true;
+        }
+
+        if (Cat == UEdGraphSchema_K2::PC_Class)
+        {
+            const UObject* SubObj = InPinType.PinSubCategoryObject.Get();
+            const UClass* AsClass = Cast<UClass>(SubObj);
+            FString TypeName = AsClass ? AsClass->GetName() : FString();
+            if (TypeName.IsEmpty()) TypeName = TEXT("UObject");
+            if (!TypeName.StartsWith(TEXT("U")) && !TypeName.StartsWith(TEXT("A")))
+            {
+                TypeName = FString::Printf(TEXT("U%s"), *TypeName);
+            }
+            OutCppType = FString::Printf(TEXT("TSubclassOf<%s>"), *TypeName);
+            return true;
+        }
+
+        if (Cat == UEdGraphSchema_K2::PC_Struct)
+        {
+            const UScriptStruct* AsStruct = Cast<UScriptStruct>(InPinType.PinSubCategoryObject.Get());
+            FString TypeName = AsStruct ? AsStruct->GetName() : FString();
+            if (TypeName.IsEmpty()) TypeName = TEXT("FStruct");
+            if (!TypeName.StartsWith(TEXT("F")))
+            {
+                TypeName = FString::Printf(TEXT("F%s"), *TypeName);
+            }
+            OutCppType = TypeName;
+            return true;
+        }
+
+        return false;
+    }
+
+    static bool TryResolveDefaultValueToCppExpr(const UEdGraphPin* InPin, FString& OutExpr, FString& OutFailureReason)
+    {
+        OutFailureReason.Reset();
+        if (!InPin)
+        {
+            OutFailureReason = TEXT("Pin is null");
+            return false;
+        }
+
         const FName& Cat = InPin->PinType.PinCategory;
-        const FString& Def = InPin->DefaultValue;
+        const FString Def = InPin->DefaultValue;
 
         if (Cat == UEdGraphSchema_K2::PC_Boolean)
         {
@@ -386,18 +591,29 @@ namespace BlueprintBusterParsers
             return true;
         }
 
-        if (Cat == UEdGraphSchema_K2::PC_Int ||
-            Cat == UEdGraphSchema_K2::PC_Int64 ||
-            Cat == UEdGraphSchema_K2::PC_Byte)
+        if (Cat == UEdGraphSchema_K2::PC_Byte)
         {
-            if (Def.IsEmpty())
+            if (const UObject* SubObj = InPin->PinType.PinSubCategoryObject.Get())
             {
-                OutExpr = TEXT("0");
+                if (const UEnum* Enum = Cast<UEnum>(SubObj))
+                {
+                    if (Def.IsEmpty() || Def == TEXT("None"))
+                    {
+                        OutExpr = FString::Printf(TEXT("static_cast<%s>(0)"), *Enum->GetName());
+                        return true;
+                    }
+                    OutExpr = FString::Printf(TEXT("%s::%s"), *Enum->GetName(), *Def);
+                    return true;
+                }
             }
-            else
-            {
-                OutExpr = Def;
-            }
+            OutExpr = Def.IsEmpty() ? TEXT("0") : Def;
+            return true;
+        }
+
+        if (Cat == UEdGraphSchema_K2::PC_Int ||
+            Cat == UEdGraphSchema_K2::PC_Int64)
+        {
+            OutExpr = Def.IsEmpty() ? TEXT("0") : Def;
             return true;
         }
 
@@ -418,6 +634,22 @@ namespace BlueprintBusterParsers
             return true;
         }
 
+        if (Cat == UEdGraphSchema_K2::PC_Real)
+        {
+            if (InPin->PinType.PinSubCategory == UEdGraphSchema_K2::PC_Double)
+            {
+                OutExpr = Def.IsEmpty() ? TEXT("0.0") : Def;
+                return true;
+            }
+            FString V = Def.IsEmpty() ? TEXT("0.0") : Def;
+            if (!V.EndsWith(TEXT("f")) && !V.EndsWith(TEXT("F")))
+            {
+                V += TEXT("f");
+            }
+            OutExpr = V;
+            return true;
+        }
+
         if (Cat == UEdGraphSchema_K2::PC_String)
         {
             OutExpr = FString::Printf(TEXT("TEXT(\"%s\")"), *EscapeStringLiteral(Def));
@@ -426,7 +658,9 @@ namespace BlueprintBusterParsers
 
         if (Cat == UEdGraphSchema_K2::PC_Name)
         {
-            OutExpr = FString::Printf(TEXT("FName(TEXT(\"%s\"))"), *EscapeStringLiteral(Def));
+            OutExpr = (Def.IsEmpty() || Def == TEXT("None"))
+                ? TEXT("NAME_None")
+                : FString::Printf(TEXT("FName(TEXT(\"%s\"))"), *EscapeStringLiteral(Def));
             return true;
         }
 
@@ -436,39 +670,510 @@ namespace BlueprintBusterParsers
             return true;
         }
 
+        if (Cat == UEdGraphSchema_K2::PC_Object ||
+            Cat == UEdGraphSchema_K2::PC_Class ||
+            Cat == UEdGraphSchema_K2::PC_SoftObject ||
+            Cat == UEdGraphSchema_K2::PC_SoftClass)
+        {
+            if (IsValid(InPin->DefaultObject))
+            {
+                const FString Path = InPin->DefaultObject->GetPathName();
+                const UClass* PinClass = Cast<UClass>(InPin->PinType.PinSubCategoryObject.Get());
+                FString TypeName = PinClass ? PinClass->GetName() : FString(TEXT("UObject"));
+                if (!TypeName.StartsWith(TEXT("U")) && !TypeName.StartsWith(TEXT("A")))
+                {
+                    TypeName = FString::Printf(TEXT("U%s"), *TypeName);
+                }
+
+                if (Cat == UEdGraphSchema_K2::PC_Class || Cat == UEdGraphSchema_K2::PC_SoftClass)
+                {
+                    OutExpr = FString::Printf(TEXT("LoadClass<%s>(nullptr, TEXT(\"%s\"))"), *TypeName, *EscapeStringLiteral(Path));
+                    return true;
+                }
+
+                OutExpr = FString::Printf(TEXT("LoadObject<%s>(nullptr, TEXT(\"%s\"))"), *TypeName, *EscapeStringLiteral(Path));
+                return true;
+            }
+            if (Def.IsEmpty() || Def == TEXT("None"))
+            {
+                OutExpr = TEXT("nullptr");
+                return true;
+            }
+            OutFailureReason = FString::Printf(TEXT("Pin has asset default value '%s' which is not supported"), *Def);
+            return false;
+        }
+
+        if (Cat == UEdGraphSchema_K2::PC_Struct)
+        {
+            if (TryResolveStructDefaultToCppExpr(InPin, OutExpr, OutFailureReason))
+            {
+                return true;
+            }
+            return false;
+        }
+
+        OutFailureReason = FString::Printf(TEXT("Pin default value category '%s' is not supported"), *Cat.ToString());
         return false;
     }
 
-    static bool TryResolveOutputPinToCppExpr(const UEdGraphPin* InOutputPin, FString& OutExpr)
+    static bool CanInlinePureCallFunction(const UK2Node_CallFunction* InCallNode, FString& OutFailureReason)
+    {
+        OutFailureReason.Reset();
+        if (!InCallNode)
+        {
+            OutFailureReason = TEXT("CallFunction node is null");
+            return false;
+        }
+        if (!InCallNode->IsNodePure())
+        {
+            OutFailureReason = TEXT("CallFunction is not pure");
+            return false;
+        }
+
+        for (const UEdGraphPin* Pin : InCallNode->Pins)
+        {
+            if (Pin && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+            {
+                OutFailureReason = TEXT("CallFunction has Exec pins");
+                return false;
+            }
+        }
+
+        UFunction* Func = InCallNode->GetTargetFunction();
+        if (!Func)
+        {
+            OutFailureReason = TEXT("CallFunction has no target UFunction");
+            return false;
+        }
+
+        bool bHasReturn = false;
+        for (TFieldIterator<FProperty> It(Func); It; ++It)
+        {
+            FProperty* Prop = *It;
+            if (!Prop || !Prop->HasAnyPropertyFlags(CPF_Parm))
+            {
+                continue;
+            }
+            if (Prop->HasAnyPropertyFlags(CPF_ReturnParm))
+            {
+                bHasReturn = true;
+                continue;
+            }
+            if (Prop->HasAnyPropertyFlags(CPF_OutParm | CPF_ReferenceParm))
+            {
+                OutFailureReason = TEXT("CallFunction has out/ref parameters");
+                return false;
+            }
+        }
+        if (!bHasReturn)
+        {
+            OutFailureReason = TEXT("CallFunction has no return value");
+            return false;
+        }
+
+        for (const UEdGraphPin* Pin : InCallNode->Pins)
+        {
+            if (!Pin)
+            {
+                continue;
+            }
+            if (Pin->Direction == EGPD_Output &&
+                Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec &&
+                Pin->PinName != UEdGraphSchema_K2::PN_ReturnValue)
+            {
+                OutFailureReason = TEXT("CallFunction has non-return output pin");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    static bool ResolvePinToCppExprRecursive(const UEdGraphPin* InPin,
+                                            FString& OutExpr,
+                                            FString& OutFailureReason,
+                                            int32 Depth,
+                                            int32 MaxDepth,
+                                            TSet<const UEdGraphPin*>& VisitingPins);
+
+    static bool ResolveCallFunctionInlineExpr(const UK2Node_CallFunction* InCallNode,
+                                              FString& OutExpr,
+                                              FString& OutFailureReason,
+                                              int32 Depth,
+                                              int32 MaxDepth,
+                                              TSet<const UEdGraphPin*>& VisitingPins)
+    {
+        FString CanInlineReason;
+        if (!CanInlinePureCallFunction(InCallNode, CanInlineReason))
+        {
+            OutFailureReason = FString::Printf(TEXT("Pure CallFunction cannot be inlined: %s"), *CanInlineReason);
+            return false;
+        }
+
+        UFunction* Func = InCallNode->GetTargetFunction();
+        if (!Func)
+        {
+            OutFailureReason = TEXT("Pure CallFunction has no target UFunction");
+            return false;
+        }
+
+        const bool bIsStatic = Func->HasAnyFunctionFlags(FUNC_Static);
+        FString TargetExpr;
+        FString TargetClassName;
+
+        if (bIsStatic)
+        {
+            const UClass* TargetCls = InCallNode->FunctionReference.GetMemberParentClass();
+            if (!IsValid(TargetCls))
+            {
+                OutFailureReason = TEXT("Pure CallFunction static target class is missing");
+                return false;
+            }
+            TargetClassName = TargetCls->GetName();
+        }
+        else
+        {
+            const UEdGraphPin* SelfPin = InCallNode->FindPin(UEdGraphSchema_K2::PN_Self);
+            if (SelfPin && SelfPin->LinkedTo.Num() > 0)
+            {
+                if (!ResolvePinToCppExprRecursive(SelfPin, TargetExpr, OutFailureReason, Depth + 1, MaxDepth, VisitingPins))
+                {
+                    OutFailureReason = FString::Printf(TEXT("Pure CallFunction target expression cannot be resolved: %s"), *OutFailureReason);
+                    return false;
+                }
+            }
+            else
+            {
+                TargetExpr = TEXT("this");
+            }
+        }
+
+        TArray<FString> ArgExprs;
+        for (TFieldIterator<FProperty> It(Func); It; ++It)
+        {
+            FProperty* Prop = *It;
+            if (!Prop || !Prop->HasAnyPropertyFlags(CPF_Parm) || Prop->HasAnyPropertyFlags(CPF_ReturnParm))
+            {
+                continue;
+            }
+
+            const UEdGraphPin* ParamPin = InCallNode->FindPin(Prop->GetFName());
+            FString ArgExpr;
+            if (!ResolvePinToCppExprRecursive(ParamPin, ArgExpr, OutFailureReason, Depth + 1, MaxDepth, VisitingPins))
+            {
+                OutFailureReason = FString::Printf(TEXT("Pure CallFunction argument '%s' cannot be resolved: %s"), *Prop->GetName(), *OutFailureReason);
+                return false;
+            }
+            ArgExprs.Add(MoveTemp(ArgExpr));
+        }
+
+        const FString Args = FString::Join(ArgExprs, TEXT(", "));
+        if (bIsStatic)
+        {
+            OutExpr = FString::Printf(TEXT("%s::%s(%s)"), *TargetClassName,
+                                      *InCallNode->FunctionReference.GetMemberName().ToString(),
+                                      *Args);
+        }
+        else if (TargetExpr == TEXT("this"))
+        {
+            OutExpr = FString::Printf(TEXT("this->%s(%s)"),
+                                      *InCallNode->FunctionReference.GetMemberName().ToString(),
+                                      *Args);
+        }
+        else
+        {
+            OutExpr = FString::Printf(TEXT("(%s)->%s(%s)"), *TargetExpr,
+                                      *InCallNode->FunctionReference.GetMemberName().ToString(),
+                                      *Args);
+        }
+
+        OutExpr = FString::Printf(TEXT("(%s)"), *OutExpr);
+        return true;
+    }
+
+    static bool ResolveOutputPinToCppExprRecursive(const UEdGraphPin* InOutputPin,
+                                                  FString& OutExpr,
+                                                  FString& OutFailureReason,
+                                                  int32 Depth,
+                                                  int32 MaxDepth,
+                                                  TSet<const UEdGraphPin*>& VisitingPins)
     {
         if (!InOutputPin)
         {
+            OutFailureReason = TEXT("Output pin is null");
+            return false;
+        }
+        if (Depth >= MaxDepth)
+        {
+            OutFailureReason = TEXT("Expression depth limit exceeded");
             return false;
         }
 
         const UEdGraphNode* Node = InOutputPin->GetOwningNode();
-        if (const UK2Node_VariableGet* GetNode = Cast<UK2Node_VariableGet>(Node))
+        if (!Node)
         {
-            OutExpr = GetNode->VariableReference.GetMemberName().ToString();
-            return !OutExpr.IsEmpty();
-        }
-
-        return false;
-    }
-
-    static bool TryResolvePinToCppExpr(const UEdGraphPin* InPin, FString& OutExpr)
-    {
-        if (!InPin)
-        {
+            OutFailureReason = TEXT("Output pin has no owning node");
             return false;
         }
 
-        if (InPin->LinkedTo.Num() > 0 && InPin->LinkedTo[0])
+        if (const UK2Node_Knot* KnotNode = Cast<UK2Node_Knot>(Node))
         {
-            return TryResolveOutputPinToCppExpr(InPin->LinkedTo[0], OutExpr);
+            const UEdGraphPin* InputPin = nullptr;
+            for (const UEdGraphPin* Pin : KnotNode->Pins)
+            {
+                if (Pin && Pin->Direction == EGPD_Input &&
+                    Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+                {
+                    InputPin = Pin;
+                    break;
+                }
+            }
+            if (!InputPin)
+            {
+                OutFailureReason = TEXT("Reroute node has no input pin");
+                return false;
+            }
+            return ResolvePinToCppExprRecursive(InputPin, OutExpr, OutFailureReason, Depth + 1, MaxDepth, VisitingPins);
         }
 
-        return TryResolveDefaultValueToCppExpr(InPin, OutExpr);
+        if (const UK2Node_VariableGet* GetNode = Cast<UK2Node_VariableGet>(Node))
+        {
+            OutExpr = GetNode->VariableReference.GetMemberName().ToString();
+            if (OutExpr.IsEmpty())
+            {
+                OutFailureReason = TEXT("VariableGet has empty variable name");
+                return false;
+            }
+            return true;
+        }
+
+        if (const UK2Node_VariableSet* SetNode = Cast<UK2Node_VariableSet>(Node))
+        {
+            if (InOutputPin->PinName == FName(TEXT("Output_Get")))
+            {
+                OutExpr = SetNode->VariableReference.GetMemberName().ToString();
+                if (OutExpr.IsEmpty())
+                {
+                    OutFailureReason = TEXT("VariableSet has empty variable name");
+                    return false;
+                }
+                return true;
+            }
+            OutFailureReason = TEXT("Only VariableSet output-get pin can be used as expression");
+            return false;
+        }
+
+        if (const UK2Node_EnumLiteral* EnumNode = Cast<UK2Node_EnumLiteral>(Node))
+        {
+            if (!IsValid(EnumNode->Enum))
+            {
+                OutFailureReason = TEXT("EnumLiteral has no Enum");
+                return false;
+            }
+            const UEdGraphPin* EnumInputPin = EnumNode->FindPin(UK2Node_EnumLiteral::GetEnumInputPinName());
+            if (!EnumInputPin)
+            {
+                OutFailureReason = TEXT("EnumLiteral has no Enum input pin");
+                return false;
+            }
+            if (EnumInputPin->DefaultValue.IsEmpty())
+            {
+                OutFailureReason = TEXT("EnumLiteral has empty default value");
+                return false;
+            }
+            OutExpr = FString::Printf(TEXT("%s::%s"), *EnumNode->Enum->GetName(), *EnumInputPin->DefaultValue);
+            return true;
+        }
+
+        if (const UK2Node_MakeArray* MakeArrayNode = Cast<UK2Node_MakeArray>(Node))
+        {
+            UEdGraphPin* OutPin = MakeArrayNode->GetOutputPin();
+            if (!OutPin)
+            {
+                OutFailureReason = TEXT("MakeArray has no output pin");
+                return false;
+            }
+            FString ElemCppType;
+            if (!TryResolvePinTypeToCppType(OutPin->PinType, ElemCppType))
+            {
+                OutFailureReason = TEXT("MakeArray element type is not supported");
+                return false;
+            }
+
+            struct FIndexedPin
+            {
+                int32 Index = 0;
+                const UEdGraphPin* Pin = nullptr;
+            };
+            TArray<FIndexedPin> Inputs;
+            for (const UEdGraphPin* Pin : MakeArrayNode->Pins)
+            {
+                if (!Pin || Pin->Direction != EGPD_Input ||
+                    Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+                {
+                    continue;
+                }
+                const FString NameStr = Pin->PinName.ToString();
+                if (!NameStr.IsNumeric())
+                {
+                    continue;
+                }
+                Inputs.Add({ FCString::Atoi(*NameStr), Pin });
+            }
+            Inputs.Sort([](const FIndexedPin& A, const FIndexedPin& B) { return A.Index < B.Index; });
+
+            TArray<FString> Items;
+            Items.Reserve(Inputs.Num());
+            for (const FIndexedPin& P : Inputs)
+            {
+                FString ItemExpr;
+                if (!ResolvePinToCppExprRecursive(P.Pin, ItemExpr, OutFailureReason, Depth + 1, MaxDepth, VisitingPins))
+                {
+                    OutFailureReason = FString::Printf(TEXT("MakeArray input %d cannot be resolved: %s"), P.Index, *OutFailureReason);
+                    return false;
+                }
+                Items.Add(MoveTemp(ItemExpr));
+            }
+
+            const FString Joined = FString::Join(Items, TEXT(", "));
+            OutExpr = FString::Printf(TEXT("TArray<%s>{%s}"), *ElemCppType, *Joined);
+            OutExpr = FString::Printf(TEXT("(%s)"), *OutExpr);
+            return true;
+        }
+
+        if (const UK2Node_Select* SelectNode = Cast<UK2Node_Select>(Node))
+        {
+            const UEdGraphPin* IndexPin = SelectNode->GetIndexPin();
+            if (!IndexPin)
+            {
+                OutFailureReason = TEXT("Select has no index pin");
+                return false;
+            }
+            if (IndexPin->PinType.PinCategory != UEdGraphSchema_K2::PC_Boolean)
+            {
+                OutFailureReason = TEXT("Only Select(bool) is supported");
+                return false;
+            }
+
+            TArray<UEdGraphPin*> OptionPins;
+            SelectNode->GetOptionPins(OptionPins);
+            if (OptionPins.Num() != 2)
+            {
+                OutFailureReason = TEXT("Select(bool) must have exactly 2 options");
+                return false;
+            }
+
+            UEdGraphPin* A = nullptr;
+            UEdGraphPin* B = nullptr;
+            for (UEdGraphPin* P : OptionPins)
+            {
+                if (P && P->PinName == TEXT("A")) A = P;
+                if (P && P->PinName == TEXT("B")) B = P;
+            }
+            if (!A || !B)
+            {
+                A = OptionPins[0];
+                B = OptionPins[1];
+            }
+
+            FString CondExpr;
+            if (!ResolvePinToCppExprRecursive(IndexPin, CondExpr, OutFailureReason, Depth + 1, MaxDepth, VisitingPins))
+            {
+                OutFailureReason = FString::Printf(TEXT("Select condition cannot be resolved: %s"), *OutFailureReason);
+                return false;
+            }
+
+            FString TrueExpr;
+            if (!ResolvePinToCppExprRecursive(A, TrueExpr, OutFailureReason, Depth + 1, MaxDepth, VisitingPins))
+            {
+                OutFailureReason = FString::Printf(TEXT("Select A cannot be resolved: %s"), *OutFailureReason);
+                return false;
+            }
+
+            FString FalseExpr;
+            if (!ResolvePinToCppExprRecursive(B, FalseExpr, OutFailureReason, Depth + 1, MaxDepth, VisitingPins))
+            {
+                OutFailureReason = FString::Printf(TEXT("Select B cannot be resolved: %s"), *OutFailureReason);
+                return false;
+            }
+
+            OutExpr = FString::Printf(TEXT("((%s) ? (%s) : (%s))"), *CondExpr, *TrueExpr, *FalseExpr);
+            return true;
+        }
+
+        if (const UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node))
+        {
+            if (InOutputPin->PinName != UEdGraphSchema_K2::PN_ReturnValue)
+            {
+                OutFailureReason = TEXT("Only ReturnValue pin can be used as expression for CallFunction");
+                return false;
+            }
+            return ResolveCallFunctionInlineExpr(CallNode, OutExpr, OutFailureReason, Depth + 1, MaxDepth, VisitingPins);
+        }
+
+        if (const UK2Node_MacroInstance* MacroNode = Cast<UK2Node_MacroInstance>(Node))
+        {
+            const UEdGraph* MacroGraph = MacroNode->GetMacroGraph();
+            if (IsValid(MacroGraph) && MacroGraph->GetName() == TEXT("FlipFlop"))
+            {
+                const FString PinName = InOutputPin->PinName.ToString();
+                if (InOutputPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Boolean &&
+                    (PinName.Equals(TEXT("IsA"), ESearchCase::IgnoreCase) ||
+                     PinName.Equals(TEXT("bIsA"), ESearchCase::IgnoreCase)))
+                {
+                    const FString StateVar = FString::Printf(TEXT("bFlipFlop_%s"),
+                                                             *MacroNode->NodeGuid.ToString(EGuidFormats::Digits));
+                    OutExpr = FString::Printf(TEXT("(!%s)"), *StateVar);
+                    return true;
+                }
+            }
+        }
+
+        OutFailureReason = FString::Printf(TEXT("Output pin node class %s is not supported for expression lowering"),
+                                           *Node->GetClass()->GetName());
+        return false;
+    }
+
+    static bool ResolvePinToCppExprRecursive(const UEdGraphPin* InPin,
+                                            FString& OutExpr,
+                                            FString& OutFailureReason,
+                                            int32 Depth,
+                                            int32 MaxDepth,
+                                            TSet<const UEdGraphPin*>& VisitingPins)
+    {
+        if (!InPin)
+        {
+            OutFailureReason = TEXT("Pin is null");
+            return false;
+        }
+        if (Depth >= MaxDepth)
+        {
+            OutFailureReason = TEXT("Expression depth limit exceeded");
+            return false;
+        }
+        if (VisitingPins.Contains(InPin))
+        {
+            OutFailureReason = TEXT("Expression cycle detected");
+            return false;
+        }
+
+        VisitingPins.Add(InPin);
+        const bool bOk = [&]()
+        {
+            if (InPin->LinkedTo.Num() > 0 && InPin->LinkedTo[0])
+            {
+                return ResolveOutputPinToCppExprRecursive(InPin->LinkedTo[0], OutExpr, OutFailureReason, Depth + 1, MaxDepth, VisitingPins);
+            }
+            return TryResolveDefaultValueToCppExpr(InPin, OutExpr, OutFailureReason);
+        }();
+        VisitingPins.Remove(InPin);
+        return bOk;
+    }
+
+    static bool ResolvePinToCppExpr(const UEdGraphPin* InPin, FString& OutExpr, FString& OutFailureReason, int32 MaxDepth)
+    {
+        TSet<const UEdGraphPin*> VisitingPins;
+        return ResolvePinToCppExprRecursive(InPin, OutExpr, OutFailureReason, 0, MaxDepth, VisitingPins);
     }
 
     // Walks the linear chain starting at InStartNode, following the default exec then-pin.
@@ -520,7 +1225,78 @@ namespace BlueprintBusterParsers
                 }
             }
 
-            Current = GetLinkedExecNode(NextPin);
+            const UEdGraphNode* NextExecNode = GetLinkedExecNode(NextPin);
+
+            if (const UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Current))
+            {
+                if (NodeInfo.IsValid() && NodeInfo->NodeKind == TEXT("CallFunction") && !CallNode->IsNodePure())
+                {
+                    if (const UK2Node_VariableSet* SetNode = Cast<UK2Node_VariableSet>(NextExecNode))
+                    {
+                        const UEdGraphPin* ReturnPin = CallNode->FindPin(UEdGraphSchema_K2::PN_ReturnValue, EGPD_Output);
+                        const UEdGraphPin* SetValuePin = SetNode->FindPin(SetNode->GetVarName(), EGPD_Input);
+                        const FString SetVarName = SetNode->VariableReference.GetMemberName().ToString();
+
+                        const UEdGraphPin* SourcePin = nullptr;
+                        if (SetValuePin && SetValuePin->LinkedTo.Num() > 0)
+                        {
+                            SourcePin = SetValuePin->LinkedTo[0];
+                            while (SourcePin)
+                            {
+                                const UK2Node_Knot* Knot = Cast<UK2Node_Knot>(SourcePin->GetOwningNode());
+                                if (!Knot)
+                                {
+                                    break;
+                                }
+                                const UEdGraphPin* KnotInput = nullptr;
+                                for (const UEdGraphPin* P : Knot->Pins)
+                                {
+                                    if (P && P->Direction == EGPD_Input &&
+                                        P->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+                                    {
+                                        KnotInput = P;
+                                        break;
+                                    }
+                                }
+                                if (!KnotInput || KnotInput->LinkedTo.Num() == 0 || !KnotInput->LinkedTo[0])
+                                {
+                                    break;
+                                }
+                                SourcePin = KnotInput->LinkedTo[0];
+                            }
+                        }
+
+                        const bool bIsReturnLinkedToSet =
+                            ReturnPin && SetValuePin &&
+                            SourcePin == ReturnPin &&
+                            ReturnPin->LinkedTo.Num() == 1 &&
+                            !SetVarName.IsEmpty();
+
+                        if (bIsReturnLinkedToSet)
+                        {
+                            NodeInfo->AssignToVariable = SetVarName;
+
+                            const UEdGraphPin* SetThenPin = nullptr;
+                            for (UEdGraphPin* Pin : SetNode->Pins)
+                            {
+                                if (Pin && Pin->Direction == EGPD_Output &&
+                                    Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec &&
+                                    Pin->PinName == UEdGraphSchema_K2::PN_Then)
+                                {
+                                    SetThenPin = Pin;
+                                    break;
+                                }
+                            }
+
+                            Current = GetLinkedExecNode(SetThenPin);
+                            Depth += 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            Current = NextExecNode;
             ++Depth;
         }
     }
@@ -545,7 +1321,8 @@ namespace BlueprintBusterParsers
         if (const UK2Node_Event* EventNode = Cast<UK2Node_Event>(InNode))
         {
             Info->NodeKind  = TEXT("Event");
-            Info->NodeLabel = EventNode->EventReference.GetMemberName().ToString();
+            const FName FnName = EventNode->GetFunctionName();
+            Info->NodeLabel = FnName.IsNone() ? EventNode->GetNodeTitle(ENodeTitleType::ListView).ToString() : FnName.ToString();
             return Info;
         }
 
@@ -593,10 +1370,11 @@ namespace BlueprintBusterParsers
                 if (SelfPin && SelfPin->LinkedTo.Num() > 0)
                 {
                     FString TargetExpr;
-                    if (!TryResolvePinToCppExpr(SelfPin, TargetExpr))
+                    FString FailureReason;
+                    if (!ResolvePinToCppExpr(SelfPin, TargetExpr, FailureReason, MaxDepth))
                     {
                         Info->NodeKind          = TEXT("Unsupported");
-                        Info->UnsupportedReason = TEXT("CallFunction target expression cannot be resolved");
+                        Info->UnsupportedReason = FString::Printf(TEXT("CallFunction target expression cannot be resolved: %s"), *FailureReason);
                         ++OutUnsupportedCount;
                         return Info;
                     }
@@ -622,10 +1400,11 @@ namespace BlueprintBusterParsers
 
                 UEdGraphPin* ParamPin = CallNode->FindPin(Prop->GetFName());
                 FString Expr;
-                if (!TryResolvePinToCppExpr(ParamPin, Expr))
+                FString FailureReason;
+                if (!ResolvePinToCppExpr(ParamPin, Expr, FailureReason, MaxDepth))
                 {
                     Info->NodeKind          = TEXT("Unsupported");
-                    Info->UnsupportedReason = FString::Printf(TEXT("CallFunction argument '%s' cannot be resolved"), *Prop->GetName());
+                    Info->UnsupportedReason = FString::Printf(TEXT("CallFunction argument '%s' cannot be resolved: %s"), *Prop->GetName(), *FailureReason);
                     ++OutUnsupportedCount;
                     return Info;
                 }
@@ -646,10 +1425,11 @@ namespace BlueprintBusterParsers
             Info->NodeLabel = TEXT("Branch");
 
             FString CondExpr;
-            if (!TryResolvePinToCppExpr(BranchNode->GetConditionPin(), CondExpr))
+            FString FailureReason;
+            if (!ResolvePinToCppExpr(BranchNode->GetConditionPin(), CondExpr, FailureReason, MaxDepth))
             {
                 Info->NodeKind          = TEXT("Unsupported");
-                Info->UnsupportedReason = TEXT("Branch condition cannot be resolved");
+                Info->UnsupportedReason = FString::Printf(TEXT("Branch condition cannot be resolved: %s"), *FailureReason);
                 ++OutUnsupportedCount;
                 return Info;
             }
@@ -705,14 +1485,114 @@ namespace BlueprintBusterParsers
             Info->NodeKind  = TEXT("VariableSet");
             Info->NodeLabel = SetNode->VariableReference.GetMemberName().ToString();
             FString ValueExpr;
-            if (!TryResolvePinToCppExpr(SetNode->GetValuePin(), ValueExpr))
+            FString FailureReason;
+            UEdGraphPin* ValuePin = SetNode->FindPin(SetNode->GetVarName(), EGPD_Input);
+            if (!ResolvePinToCppExpr(ValuePin, ValueExpr, FailureReason, MaxDepth))
             {
                 Info->NodeKind          = TEXT("Unsupported");
-                Info->UnsupportedReason = TEXT("VariableSet value cannot be resolved");
+                Info->UnsupportedReason = FString::Printf(TEXT("VariableSet value cannot be resolved: %s"), *FailureReason);
                 ++OutUnsupportedCount;
                 return Info;
             }
             Info->ValueExpression = ValueExpr;
+            return Info;
+        }
+
+        if (const UK2Node_AddDelegate* AddDelegateNode = Cast<UK2Node_AddDelegate>(InNode))
+        {
+            Info->NodeKind  = TEXT("AddDelegate");
+            Info->NodeLabel = TEXT("AddDelegate");
+
+            const FString DelegateName = AddDelegateNode->GetPropertyName().ToString();
+            if (DelegateName.IsEmpty() || DelegateName == TEXT("None"))
+            {
+                Info->NodeKind          = TEXT("Unsupported");
+                Info->UnsupportedReason = TEXT("AddDelegate has no delegate property name");
+                ++OutUnsupportedCount;
+                return Info;
+            }
+            Info->DelegatePropertyName = DelegateName;
+
+            UEdGraphPin* TargetPin = AddDelegateNode->FindPin(UEdGraphSchema_K2::PN_Self);
+            FString TargetExpr;
+            FString FailureReason;
+            if (!ResolvePinToCppExpr(TargetPin, TargetExpr, FailureReason, MaxDepth))
+            {
+                Info->NodeKind          = TEXT("Unsupported");
+                Info->UnsupportedReason = FString::Printf(TEXT("AddDelegate target cannot be resolved: %s"), *FailureReason);
+                ++OutUnsupportedCount;
+                return Info;
+            }
+            Info->TargetExpression = TargetExpr;
+
+            UEdGraphPin* DelegatePin = AddDelegateNode->GetDelegatePin();
+            if (!DelegatePin || DelegatePin->LinkedTo.Num() == 0 || !DelegatePin->LinkedTo[0])
+            {
+                Info->NodeKind          = TEXT("Unsupported");
+                Info->UnsupportedReason = TEXT("AddDelegate has no bound delegate function (missing CreateDelegate connection)");
+                ++OutUnsupportedCount;
+                return Info;
+            }
+
+            const UEdGraphNode* BoundNode = DelegatePin->LinkedTo[0]->GetOwningNode();
+            if (const UK2Node_CreateDelegate* CreateDelegateNode = Cast<UK2Node_CreateDelegate>(BoundNode))
+            {
+                const FName HandlerName = CreateDelegateNode->GetFunctionName();
+                if (HandlerName.IsNone())
+                {
+                    Info->NodeKind          = TEXT("Unsupported");
+                    Info->UnsupportedReason = TEXT("CreateDelegate has no selected function name");
+                    ++OutUnsupportedCount;
+                    return Info;
+                }
+                Info->DelegateHandlerFunctionName = HandlerName.ToString();
+
+                UEdGraphPin* ObjPin = CreateDelegateNode->GetObjectInPin();
+                if (ObjPin && ObjPin->LinkedTo.Num() > 0)
+                {
+                    FString ObjExpr;
+                    FString ObjFailure;
+                    if (!ResolvePinToCppExpr(ObjPin, ObjExpr, ObjFailure, MaxDepth))
+                    {
+                        Info->NodeKind          = TEXT("Unsupported");
+                        Info->UnsupportedReason = FString::Printf(TEXT("CreateDelegate object cannot be resolved: %s"), *ObjFailure);
+                        ++OutUnsupportedCount;
+                        return Info;
+                    }
+                    if (ObjExpr != TEXT("this"))
+                    {
+                        Info->NodeKind          = TEXT("Unsupported");
+                        Info->UnsupportedReason = TEXT("CreateDelegate object must be 'this'");
+                        ++OutUnsupportedCount;
+                        return Info;
+                    }
+                }
+            }
+            else if (const UK2Node_Event* EventNode = Cast<UK2Node_Event>(BoundNode))
+            {
+                const FName HandlerName = EventNode->GetFunctionName();
+                FString HandlerStr = HandlerName.IsNone()
+                    ? EventNode->GetNodeTitle(ENodeTitleType::ListView).ToString()
+                    : HandlerName.ToString();
+                HandlerStr.TrimStartAndEndInline();
+                if (HandlerStr.IsEmpty())
+                {
+                    Info->NodeKind          = TEXT("Unsupported");
+                    Info->UnsupportedReason = TEXT("Bound event has empty function name");
+                    ++OutUnsupportedCount;
+                    return Info;
+                }
+                Info->DelegateHandlerFunctionName = HandlerStr;
+            }
+            else
+            {
+                Info->NodeKind          = TEXT("Unsupported");
+                Info->UnsupportedReason = FString::Printf(TEXT("AddDelegate bound node is not supported: %s"),
+                                                          BoundNode ? *BoundNode->GetClass()->GetName() : TEXT("null"));
+                ++OutUnsupportedCount;
+                return Info;
+            }
+
             return Info;
         }
 
@@ -726,6 +1606,37 @@ namespace BlueprintBusterParsers
                 Info->NodeLabel         = TEXT("UK2Node_MacroInstance");
                 Info->UnsupportedReason = TEXT("Macro instance has no MacroGraph");
                 ++OutUnsupportedCount;
+                return Info;
+            }
+
+            if (MacroGraph->GetName() == TEXT("FlipFlop"))
+            {
+                Info->NodeKind  = TEXT("FlipFlop");
+                Info->NodeLabel = TEXT("FlipFlop");
+                Info->FlipFlopStateVarName = FString::Printf(
+                    TEXT("bFlipFlop_%s"),
+                    *MacroNode->NodeGuid.ToString(EGuidFormats::Digits));
+
+                const UEdGraphPin* APin = MacroNode->FindPin(TEXT("A"));
+                const UEdGraphPin* BPin = MacroNode->FindPin(TEXT("B"));
+                if (!APin || !BPin)
+                {
+                    Info->NodeKind          = TEXT("Unsupported");
+                    Info->UnsupportedReason = TEXT("FlipFlop macro pins A/B not found");
+                    ++OutUnsupportedCount;
+                    return Info;
+                }
+
+                if (const UEdGraphNode* ANext = GetLinkedExecNode(APin))
+                {
+                    TraceLinearChain(ANext, Depth + 1, MaxDepth, VisitedThisChain,
+                                     Info->BranchTrue, MacroGraphStack, OutTotalCount, OutUnsupportedCount);
+                }
+                if (const UEdGraphNode* BNext = GetLinkedExecNode(BPin))
+                {
+                    TraceLinearChain(BNext, Depth + 1, MaxDepth, VisitedThisChain,
+                                     Info->BranchFalse, MacroGraphStack, OutTotalCount, OutUnsupportedCount);
+                }
                 return Info;
             }
 
@@ -767,7 +1678,7 @@ namespace BlueprintBusterParsers
             return Info;
         }
 
-        // Anything else — preserve a stub so the translator can emit a TODO.
+        // Anything else — preserve a stub so the translator can emit a clear failure.
         Info->NodeKind         = TEXT("Unsupported");
         Info->NodeLabel        = InNode->GetClass()->GetName();
         Info->UnsupportedReason = FString::Printf(

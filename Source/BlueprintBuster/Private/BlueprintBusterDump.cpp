@@ -50,6 +50,18 @@ namespace
 		{
 			Obj->SetStringField(TEXT("valueExpr"), InNode->ValueExpression);
 		}
+		if (!InNode->DelegatePropertyName.IsEmpty())
+		{
+			Obj->SetStringField(TEXT("delegate"), InNode->DelegatePropertyName);
+		}
+		if (!InNode->DelegateHandlerFunctionName.IsEmpty())
+		{
+			Obj->SetStringField(TEXT("handler"), InNode->DelegateHandlerFunctionName);
+		}
+		if (!InNode->FlipFlopStateVarName.IsEmpty())
+		{
+			Obj->SetStringField(TEXT("stateVar"), InNode->FlipFlopStateVarName);
+		}
 		if (!InNode->UnsupportedReason.IsEmpty())
 		{
 			Obj->SetStringField(TEXT("unsupported"), InNode->UnsupportedReason);
@@ -67,6 +79,10 @@ namespace
 				Args.Add(MakeShared<FJsonValueObject>(A));
 			}
 			Obj->SetArrayField(TEXT("args"), Args);
+		}
+		if (!InNode->AssignToVariable.IsEmpty())
+		{
+			Obj->SetStringField(TEXT("assignTo"), InNode->AssignToVariable);
 		}
 
 		auto SerialiseList = [&](const TArray<TSharedPtr<FBPGraphNodeInfo>>& InList, const FString& Field)

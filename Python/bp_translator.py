@@ -45,6 +45,13 @@ DIVIDER_WIDTH = 70           # //***...***// total width
 DEFAULT_MODULE_API = "LADOGA_API"
 FORBIDDEN_NAME_SUBSTRINGS = ("QC",)   # rejected per project rule
 
+LOAD_TYPE_INCLUDES = {
+    "UMaterialInterface": "Materials/MaterialInterface.h",
+    "UMaterialInstanceDynamic": "Materials/MaterialInstanceDynamic.h",
+    "UStaticMesh": "Engine/StaticMesh.h",
+    "UTexture": "Engine/Texture.h",
+}
+
 
 # ─── Data model (mirrors the JSON the commandlet emits) ───────────────────────
 
@@ -82,6 +89,10 @@ class GraphNode:
     condition: str = ""
     value_expr: str = ""
     args: List[Dict[str, str]] = field(default_factory=list)
+    delegate: str = ""
+    handler: str = ""
+    state_var: str = ""
+    assign_to: str = ""
     next: List["GraphNode"] = field(default_factory=list)
     branch_true: List["GraphNode"] = field(default_factory=list)
     branch_false: List["GraphNode"] = field(default_factory=list)
@@ -157,6 +168,10 @@ def _parse_node(d: Optional[Dict[str, Any]]) -> Optional[GraphNode]:
         condition=d.get("condition", ""),
         value_expr=d.get("valueExpr", ""),
         args=list(d.get("args", []) or []),
+        delegate=d.get("delegate", ""),
+        handler=d.get("handler", ""),
+        state_var=d.get("stateVar", ""),
+        assign_to=d.get("assignTo", ""),
         next=_children("next"),
         branch_true=_children("true"),
         branch_false=_children("false"),
@@ -551,6 +566,29 @@ def divider(label: str) -> str:
     return f"//{'*' * (6 + left)}{label}{'*' * (6 + right)}//"
 
 
+def _collect_state_vars(dump: DumpData) -> List[str]:
+    out: set[str] = set()
+
+    def walk(node: Optional[GraphNode]) -> None:
+        if node is None:
+            return
+        if node.kind == "FlipFlop" and node.state_var:
+            out.add(node.state_var)
+        for child in (node.next or []):
+            walk(child)
+        for child in (node.branch_true or []):
+            walk(child)
+        for child in (node.branch_false or []):
+            walk(child)
+
+    for t in dump.event_trees:
+        walk(t.root)
+    for f in dump.custom_functions:
+        walk(f.root)
+
+    return sorted(out)
+
+
 def emit_header(
     dump: DumpData,
     class_name: str,
@@ -632,6 +670,8 @@ def emit_header(
         )
         custom_func_decls.append(block)
 
+    state_vars = _collect_state_vars(dump)
+
     # Forward declarations from properties + components + function params.
     fwd_set: set = set()
     for comp in dump.components:
@@ -688,7 +728,8 @@ def emit_header(
     lines += [
         "",
         "private:",
-        "    // No private properties were dumped — add cached state here.",
+        "    // Cached state used by generated flow-control nodes.",
+        *([f"    bool {v} = false;" for v in state_vars] if state_vars else []),
         "",
         f"    {divider('FUNCTIONS')}",
         "public:",
@@ -741,6 +782,53 @@ def emit_source(
     lines += [
         f"#include \"{class_name}.h\"",
     ]
+
+    def walk(n: Optional[GraphNode]) -> List[GraphNode]:
+        if not n:
+            return []
+        out: List[GraphNode] = [n]
+        for c in n.next:
+            out += walk(c)
+        for c in n.branch_true:
+            out += walk(c)
+        for c in n.branch_false:
+            out += walk(c)
+        return out
+
+    exprs: List[str] = []
+    for t in dump.event_trees:
+        for n in walk(t.root):
+            if n.condition:
+                exprs.append(n.condition)
+            if n.value_expr:
+                exprs.append(n.value_expr)
+            if n.args:
+                for a in n.args:
+                    v = a.get("expr", "")
+                    if v:
+                        exprs.append(v)
+    for func in dump.custom_functions:
+        for n in walk(func.root):
+            if n.condition:
+                exprs.append(n.condition)
+            if n.value_expr:
+                exprs.append(n.value_expr)
+            if n.args:
+                for a in n.args:
+                    v = a.get("expr", "")
+                    if v:
+                        exprs.append(v)
+
+    load_types: set = set()
+    for e in exprs:
+        for m in re.finditer(r"Load(?:Object|Class)<([A-Za-z_0-9]+)>", e):
+            load_types.add(m.group(1))
+
+    for t in sorted(load_types):
+        inc = LOAD_TYPE_INCLUDES.get(t, "")
+        if not inc:
+            raise RuntimeError(f"LoadObject/LoadClass used with unsupported include type: {t}")
+        lines.append(f"#include \"{inc}\"")
 
     # Component includes (best-effort).
     include_set: List[str] = []
@@ -832,7 +920,7 @@ def emit_source(
         ]
         bp_tree = _find_event_tree(dump, "ReceiveBeginPlay")
         if bp_tree:
-            lines += _emit_node_chain(bp_tree, indent=1)
+            lines += _emit_node_chain(bp_tree, indent=1, class_name=class_name)
         lines += ["}", ""]
 
         if has_tick:
@@ -843,7 +931,7 @@ def emit_source(
                 "    Super::Tick(DeltaSeconds);",
             ]
             if tick_tree:
-                lines += _emit_node_chain(tick_tree, indent=1)
+                lines += _emit_node_chain(tick_tree, indent=1, class_name=class_name)
             lines += ["}", ""]
 
     for tree in dump.event_trees:
@@ -858,7 +946,7 @@ def emit_source(
             f"void {class_name}::{cpp_name}()",
             "{",
         ]
-        lines += _emit_node_chain(tree.root, indent=1)
+        lines += _emit_node_chain(tree.root, indent=1, class_name=class_name)
         lines += ["}", ""]
 
     # ── Custom Blueprint functions ───────────────────────────────────────────
@@ -886,7 +974,7 @@ def emit_source(
                              f"{(' ' + r.cpp_class_name) if r.cpp_class_name else ''}")
 
         if func.root:
-            lines += _emit_node_chain(func.root, indent=1)
+            lines += _emit_node_chain(func.root, indent=1, class_name=class_name)
         else:
             lines.append("    // (empty BP function body)")
 
@@ -906,7 +994,7 @@ def _find_event_tree(dump: DumpData, event_label: str) -> Optional[GraphNode]:
     return None
 
 
-def _emit_node_chain(root: GraphNode, indent: int) -> List[str]:
+def _emit_node_chain(root: GraphNode, indent: int, class_name: str) -> List[str]:
     """Emits the linear chain (root + root.next + branches)."""
     pad = "    " * indent
     out: List[str] = []
@@ -923,11 +1011,37 @@ def _emit_node_chain(root: GraphNode, indent: int) -> List[str]:
             args = ", ".join(arg_exprs)
 
             if node.target_expr:
-                out.append(f"{local_pad}{node.target_expr}->{node.function_name}({args});")
+                expr = f"{node.target_expr}->{node.function_name}({args})"
             elif node.target_class_name:
-                out.append(f"{local_pad}{node.target_class_name}::{node.function_name}({args});")
+                expr = f"{node.target_class_name}::{node.function_name}({args})"
             else:
-                out.append(f"{local_pad}this->{node.function_name}({args});")
+                expr = f"this->{node.function_name}({args})"
+
+            if node.assign_to:
+                out.append(f"{local_pad}{node.assign_to} = {expr};")
+            else:
+                out.append(f"{local_pad}{expr};")
+        elif node.kind == "AddDelegate":
+            if not node.target_expr or not node.delegate or not node.handler:
+                raise RuntimeError("AddDelegate node is missing target/delegate/handler")
+            out.append(
+                f"{local_pad}{node.target_expr}->{node.delegate}.AddDynamic("
+                f"this, &{class_name}::{node.handler});"
+            )
+        elif node.kind == "FlipFlop":
+            if not node.state_var:
+                raise RuntimeError("FlipFlop node is missing state var name")
+            out.append(f"{local_pad}if (!{node.state_var})")
+            out.append(f"{local_pad}{{")
+            for child in node.branch_true:
+                emit_node(child, depth + 1)
+            out.append(f"{local_pad}}}")
+            out.append(f"{local_pad}else")
+            out.append(f"{local_pad}{{")
+            for child in node.branch_false:
+                emit_node(child, depth + 1)
+            out.append(f"{local_pad}}}")
+            out.append(f"{local_pad}{node.state_var} = !{node.state_var};")
         elif node.kind == "Branch":
             if not node.condition:
                 raise RuntimeError("Branch node has no resolved condition expression")
