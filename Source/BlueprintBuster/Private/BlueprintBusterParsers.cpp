@@ -1123,7 +1123,8 @@ namespace BlueprintBusterParsers
                 {
                     const FString StateVar = FString::Printf(TEXT("bFlipFlop_%s"),
                                                              *MacroNode->NodeGuid.ToString(EGuidFormats::Digits));
-                    OutExpr = FString::Printf(TEXT("(!%s)"), *StateVar);
+                    OutExpr = FString::Printf(TEXT("bFlipFlopIsA_%s"),
+                                              *MacroNode->NodeGuid.ToString(EGuidFormats::Digits));
                     return true;
                 }
             }
@@ -1176,6 +1177,22 @@ namespace BlueprintBusterParsers
         return ResolvePinToCppExprRecursive(InPin, OutExpr, OutFailureReason, 0, MaxDepth, VisitingPins);
     }
 
+    static bool NodeHasExecPins(const UEdGraphNode* InNode)
+    {
+        if (!InNode)
+        {
+            return false;
+        }
+        for (const UEdGraphPin* Pin : InNode->Pins)
+        {
+            if (Pin && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Walks the linear chain starting at InStartNode, following the default exec then-pin.
     static void TraceLinearChain(const UEdGraphNode* InStartNode,
                                  int32 Depth,
@@ -1215,7 +1232,8 @@ namespace BlueprintBusterParsers
                     // For Branch/Sequence we hand off via dedicated traversal — bail here.
                     if (Current->IsA<UK2Node_IfThenElse>() ||
                         Current->IsA<UK2Node_ExecutionSequence>() ||
-                        Current->IsA<UK2Node_MacroInstance>())
+                        Current->IsA<UK2Node_MacroInstance>() ||
+                        (Current->IsA<UK2Node_VariableGet>() && NodeHasExecPins(Current)))
                     {
                         NextPin = nullptr;
                         break;
@@ -1476,6 +1494,55 @@ namespace BlueprintBusterParsers
         // Variable get / set.
         if (const UK2Node_VariableGet* GetNode = Cast<UK2Node_VariableGet>(InNode))
         {
+            const bool bHasExec = NodeHasExecPins(GetNode);
+            if (bHasExec)
+            {
+                const FString VarName = GetNode->VariableReference.GetMemberName().ToString();
+                if (VarName.IsEmpty())
+                {
+                    Info->NodeKind          = TEXT("Unsupported");
+                    Info->NodeLabel         = TEXT("VariableGet");
+                    Info->UnsupportedReason = TEXT("Validated VariableGet has empty variable name");
+                    ++OutUnsupportedCount;
+                    return Info;
+                }
+
+                Info->NodeKind  = TEXT("Branch");
+                Info->NodeLabel = TEXT("IsValid");
+                Info->ConditionExpression = FString::Printf(TEXT("IsValid(%s)"), *VarName);
+
+                const UEdGraphPin* ThenPin = nullptr;
+                const UEdGraphPin* ElsePin = nullptr;
+                for (const UEdGraphPin* Pin : GetNode->Pins)
+                {
+                    if (!Pin || Pin->Direction != EGPD_Output || Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+                    {
+                        continue;
+                    }
+                    if (Pin->PinName == UEdGraphSchema_K2::PN_Then)
+                    {
+                        ThenPin = Pin;
+                    }
+                    else if (Pin->PinName == UEdGraphSchema_K2::PN_Else)
+                    {
+                        ElsePin = Pin;
+                    }
+                }
+
+                if (const UEdGraphNode* ThenNext = GetLinkedExecNode(ThenPin))
+                {
+                    TraceLinearChain(ThenNext, Depth + 1, MaxDepth, VisitedThisChain,
+                                     Info->BranchTrue, MacroGraphStack, OutTotalCount, OutUnsupportedCount);
+                }
+                if (const UEdGraphNode* ElseNext = GetLinkedExecNode(ElsePin))
+                {
+                    TraceLinearChain(ElseNext, Depth + 1, MaxDepth, VisitedThisChain,
+                                     Info->BranchFalse, MacroGraphStack, OutTotalCount, OutUnsupportedCount);
+                }
+
+                return Info;
+            }
+
             Info->NodeKind  = TEXT("VariableGet");
             Info->NodeLabel = GetNode->VariableReference.GetMemberName().ToString();
             return Info;

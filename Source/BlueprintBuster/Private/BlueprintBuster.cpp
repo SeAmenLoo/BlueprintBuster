@@ -146,6 +146,7 @@ void FBlueprintBusterModule::ProcessSelectedBlueprints(bool bGenerateCpp)
     SlowTask.MakeDialog(true);
 
     int32 Successes = 0;
+    TSet<FString> VisitedBlueprintPaths;
     for (UBlueprint* Blueprint : Blueprints)
     {
         if (!IsValid(Blueprint))
@@ -160,7 +161,7 @@ void FBlueprintBusterModule::ProcessSelectedBlueprints(bool bGenerateCpp)
         }
 
         const FString DumpFilePath = BlueprintBusterDump::MakeDumpFilePath(DumpDir, Blueprint);
-        if (!BlueprintBusterDump::DumpBlueprintToJsonFile(Blueprint, DumpFilePath, 64, nullptr, bGenerateCpp))
+        if (!BlueprintBusterDump::DumpBlueprintToJsonFilesRecursive(Blueprint, DumpDir, 64, 10, nullptr, bGenerateCpp, &VisitedBlueprintPaths))
         {
             continue;
         }

@@ -1,12 +1,15 @@
 #include "BlueprintBusterDump.h"
 
 #include "BlueprintBusterParsers.h"
+#include "BlueprintBuster.h"
 
 #include "Engine/Blueprint.h"
 #include "GameFramework/Actor.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+
+#include "Algo/Sort.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -15,6 +18,82 @@
 
 namespace
 {
+	bool TryConvertBPGCPathToBlueprintPath(const FString& InClassPath, FString& OutBlueprintPath)
+	{
+		int32 DotIdx = INDEX_NONE;
+		if (!InClassPath.FindLastChar(TEXT('.'), DotIdx))
+		{
+			return false;
+		}
+
+		const FString ObjName = InClassPath.Mid(DotIdx + 1);
+		if (!ObjName.EndsWith(TEXT("_C")))
+		{
+			return false;
+		}
+
+		OutBlueprintPath = InClassPath.Left(DotIdx + 1) + ObjName.LeftChop(2);
+		return true;
+	}
+
+	void CollectBlueprintDepsFromNode(const TSharedPtr<FBPGraphNodeInfo>& InNode, TSet<FString>& InOutDeps)
+	{
+		if (!InNode.IsValid())
+		{
+			return;
+		}
+
+		if (!InNode->TargetClassPath.IsEmpty())
+		{
+			FString BPPath;
+			if (TryConvertBPGCPathToBlueprintPath(InNode->TargetClassPath, BPPath))
+			{
+				InOutDeps.Add(BPPath);
+			}
+		}
+
+		for (const TSharedPtr<FBPGraphNodeInfo>& N : InNode->Next)
+		{
+			CollectBlueprintDepsFromNode(N, InOutDeps);
+		}
+		for (const TSharedPtr<FBPGraphNodeInfo>& N : InNode->BranchTrue)
+		{
+			CollectBlueprintDepsFromNode(N, InOutDeps);
+		}
+		for (const TSharedPtr<FBPGraphNodeInfo>& N : InNode->BranchFalse)
+		{
+			CollectBlueprintDepsFromNode(N, InOutDeps);
+		}
+	}
+
+	void CollectBlueprintDependencies(FBPDumpData& InOutDump)
+	{
+		TSet<FString> Deps;
+
+		if (!InOutDump.ParentClassPath.IsEmpty())
+		{
+			FString BPPath;
+			if (TryConvertBPGCPathToBlueprintPath(InOutDump.ParentClassPath, BPPath))
+			{
+				Deps.Add(BPPath);
+			}
+		}
+
+		for (const FBPEventTreeInfo& Tree : InOutDump.EventTrees)
+		{
+			CollectBlueprintDepsFromNode(Tree.EventRoot, Deps);
+		}
+		for (const FBPCustomFunctionInfo& Func : InOutDump.CustomFunctions)
+		{
+			CollectBlueprintDepsFromNode(Func.FunctionRoot, Deps);
+		}
+
+		Deps.Remove(InOutDump.BlueprintPath);
+
+		InOutDump.DependencyBlueprintPaths = Deps.Array();
+		Algo::Sort(InOutDump.DependencyBlueprintPaths);
+	}
+
 	TSharedPtr<FJsonObject> NodeToJson(const TSharedPtr<FBPGraphNodeInfo>& InNode)
 	{
 		if (!InNode.IsValid())
@@ -120,6 +199,16 @@ namespace
 		Root->SetBoolField(TEXT("isActorDerived"), InDump.bIsActorDerived);
 		Root->SetNumberField(TEXT("totalNodeCount"), InDump.TotalNodeCount);
 		Root->SetNumberField(TEXT("unsupportedNodeCount"), InDump.UnsupportedNodeCount);
+		if (InDump.DependencyBlueprintPaths.Num() > 0)
+		{
+			TArray<TSharedPtr<FJsonValue>> DepArr;
+			DepArr.Reserve(InDump.DependencyBlueprintPaths.Num());
+			for (const FString& Dep : InDump.DependencyBlueprintPaths)
+			{
+				DepArr.Add(MakeShared<FJsonValueString>(Dep));
+			}
+			Root->SetArrayField(TEXT("dependencyBlueprints"), DepArr);
+		}
 
 		TArray<TSharedPtr<FJsonValue>> CompArr;
 		for (const FBPComponentInfo& Comp : InDump.Components)
@@ -283,6 +372,7 @@ bool BlueprintBusterDump::DumpBlueprintToJsonFile(UBlueprint* Blueprint, const F
 	BlueprintBusterParsers::ParseClassDefaultObject(Blueprint, Dump.Defaults);
 	BlueprintBusterParsers::ParseExecutionGraphs(Blueprint, Dump.EventTrees, Dump.UnsupportedNodeCount, Dump.TotalNodeCount, MaxDepth);
 	BlueprintBusterParsers::ParseFunctionGraphs(Blueprint, Dump.CustomFunctions, Dump.UnsupportedNodeCount, Dump.TotalNodeCount, MaxDepth);
+	CollectBlueprintDependencies(Dump);
 
 	const FString FinalOutPath = OutputFilePath.IsEmpty() ? MakeDumpFilePath(FString(), Blueprint) : OutputFilePath;
 	const FString FinalOutDir = FPaths::GetPath(FinalOutPath);
@@ -302,5 +392,88 @@ bool BlueprintBusterDump::DumpBlueprintToJsonFile(UBlueprint* Blueprint, const F
 		return Dump.UnsupportedNodeCount == 0;
 	}
 	return true;
+}
+
+bool BlueprintBusterDump::DumpBlueprintToJsonFilesRecursive(UBlueprint* Blueprint,
+                                                           const FString& OutputDir,
+                                                           int32 MaxDepth,
+                                                           int32 MaxDependencyDepth,
+                                                           FBPDumpData* OutRootDump,
+                                                           bool bFailOnUnsupported,
+                                                           TSet<FString>* InOutVisitedBlueprintPaths)
+{
+	if (!IsValid(Blueprint))
+	{
+		return false;
+	}
+
+	const FString BaseDir = OutputDir.IsEmpty() ? GetDefaultDumpDirectory() : OutputDir;
+
+	TSet<FString> LocalVisited;
+	TSet<FString>& Visited = InOutVisitedBlueprintPaths ? *InOutVisitedBlueprintPaths : LocalVisited;
+
+	TArray<TPair<FString, int32>> Queue;
+	Queue.Reserve(32);
+
+	const FString RootPath = Blueprint->GetPathName();
+	if (!Visited.Contains(RootPath))
+	{
+		Visited.Add(RootPath);
+		Queue.Add({ RootPath, 0 });
+	}
+
+	bool bOk = true;
+	bool bRootDumpCaptured = false;
+
+	for (int32 Index = 0; Index < Queue.Num(); ++Index)
+	{
+		const FString CurrentPath = Queue[Index].Key;
+		const int32 Depth = Queue[Index].Value;
+
+		UBlueprint* Current = (CurrentPath == RootPath) ? Blueprint : LoadObject<UBlueprint>(nullptr, *CurrentPath);
+		if (!IsValid(Current))
+		{
+			UE_LOG(LogBlueprintBuster, Error, TEXT("Could not load dependent blueprint '%s'"), *CurrentPath);
+			return false;
+		}
+
+		const FString OutPath = MakeDumpFilePath(BaseDir, Current);
+		FBPDumpData Dump;
+		const bool bDumpOk = DumpBlueprintToJsonFile(Current, OutPath, MaxDepth, &Dump, bFailOnUnsupported);
+		if (!bDumpOk)
+		{
+			bOk = false;
+			if (bFailOnUnsupported)
+			{
+				UE_LOG(LogBlueprintBuster, Error, TEXT("FullDump failed for '%s' (unsupported nodes remain). JSON still written: %s"), *Current->GetName(), *OutPath);
+				return false;
+			}
+		}
+
+		if (!bRootDumpCaptured && CurrentPath == RootPath)
+		{
+			if (OutRootDump)
+			{
+				*OutRootDump = Dump;
+			}
+			bRootDumpCaptured = true;
+		}
+
+		if (Depth >= MaxDependencyDepth)
+		{
+			continue;
+		}
+
+		for (const FString& Dep : Dump.DependencyBlueprintPaths)
+		{
+			if (!Visited.Contains(Dep))
+			{
+				Visited.Add(Dep);
+				Queue.Add({ Dep, Depth + 1 });
+			}
+		}
+	}
+
+	return bOk;
 }
 

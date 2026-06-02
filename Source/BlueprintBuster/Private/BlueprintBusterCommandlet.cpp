@@ -116,23 +116,23 @@ bool UBlueprintBusterCommandlet::ProcessBlueprint(const FString& InBlueprintPath
         return false;
     }
 
-    const FString OutPath = BlueprintBusterDump::MakeDumpFilePath(InOutputDir, Blueprint);
-
     FBPDumpData Dump;
-    if (!BlueprintBusterDump::DumpBlueprintToJsonFile(Blueprint, OutPath, InMaxDepth, &Dump, bFullDump))
+    if (!BlueprintBusterDump::DumpBlueprintToJsonFilesRecursive(Blueprint, InOutputDir, InMaxDepth, 10, &Dump, bFullDump))
     {
         UE_LOG(LogBlueprintBuster, Error,
-               TEXT("Failed to write dump for '%s' to '%s'"),
-               *Blueprint->GetName(), *OutPath);
+               TEXT("Failed to write dump for '%s'"),
+               *Blueprint->GetName());
         return false;
     }
 
+    const FString OutPath = BlueprintBusterDump::MakeDumpFilePath(InOutputDir, Blueprint);
     UE_LOG(LogBlueprintBuster, Display,
-           TEXT("Dumped %s → %s (%d components, %d defaults, %d nodes, %d functions, %d unsupported)"),
+           TEXT("Dumped %s → %s (%d components, %d defaults, %d nodes, %d functions, %d unsupported, %d deps)"),
            *Dump.BlueprintName, *OutPath,
            Dump.Components.Num(), Dump.Defaults.Num(),
            Dump.TotalNodeCount, Dump.CustomFunctions.Num(),
-           Dump.UnsupportedNodeCount);
+           Dump.UnsupportedNodeCount,
+           Dump.DependencyBlueprintPaths.Num());
 
     return true;
 }

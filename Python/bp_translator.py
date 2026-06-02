@@ -1031,7 +1031,12 @@ def _emit_node_chain(root: GraphNode, indent: int, class_name: str) -> List[str]
         elif node.kind == "FlipFlop":
             if not node.state_var:
                 raise RuntimeError("FlipFlop node is missing state var name")
-            out.append(f"{local_pad}if (!{node.state_var})")
+            if node.state_var.startswith("bFlipFlop_"):
+                is_a_var = "bFlipFlopIsA_" + node.state_var[len("bFlipFlop_"):]
+            else:
+                is_a_var = node.state_var + "_IsA"
+            out.append(f"{local_pad}const bool {is_a_var} = !{node.state_var};")
+            out.append(f"{local_pad}if ({is_a_var})")
             out.append(f"{local_pad}{{")
             for child in node.branch_true:
                 emit_node(child, depth + 1)

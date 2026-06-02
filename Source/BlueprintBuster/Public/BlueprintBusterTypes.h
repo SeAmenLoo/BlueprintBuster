@@ -215,6 +215,8 @@ struct FBPDumpData
     // True for AActor-derived BPs, false for ActorComponent / UObject BPs.
     bool bIsActorDerived = false;
 
+    TArray<FString> DependencyBlueprintPaths;
+
     TArray<FBPComponentInfo>      Components;
     TArray<FBPPropertyInfo>       Defaults;
     TArray<FBPEventTreeInfo>      EventTrees;

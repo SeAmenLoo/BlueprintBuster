@@ -129,6 +129,7 @@ int32 UBlueprintBusterConvertCommandlet::Main(const FString& Params)
 	}
 
 	int32 Successes = 0;
+	TSet<FString> VisitedBlueprintPaths;
 	for (const FString& ObjectPath : BlueprintObjectPaths)
 	{
 		UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *ObjectPath);
@@ -139,7 +140,7 @@ int32 UBlueprintBusterConvertCommandlet::Main(const FString& Params)
 		}
 
 		const FString DumpFilePath = BlueprintBusterDump::MakeDumpFilePath(DumpDir, Blueprint);
-		if (!BlueprintBusterDump::DumpBlueprintToJsonFile(Blueprint, DumpFilePath, MaxDepth, nullptr, bFullDump))
+		if (!BlueprintBusterDump::DumpBlueprintToJsonFilesRecursive(Blueprint, DumpDir, MaxDepth, 10, nullptr, bFullDump, &VisitedBlueprintPaths))
 		{
 			if (bFullDump)
 			{

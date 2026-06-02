@@ -56,6 +56,15 @@
   - 在表达式解析阶段为 `FlipFlop` 宏实例补齐 bool 输出 pin 的 lowering：
     - `IsA` → `(!bFlipFlop_<GuidDigits>)`
 
+### 7) “Validated Get / IsValid” 变体的 `VariableGet` 没有被降级为判空分支
+- 典型表现
+  - 原蓝图存在 `Is Valid / Is Not Valid` 执行分支，但生成 C++ 直接使用对象（例如直接 `Trigger->...`）
+- 解决方案
+  - Dump 解析阶段识别带 Exec pins 的 `UK2Node_VariableGet`，降级为：
+    - `kind: Branch`
+    - `condition: IsValid(<VarName>)`
+    - `true/false` 分支分别接 `Then/Else` exec 链
+
 ## 案例记录
 
 ### BP_Light（/Game/DemoTemplate/Blueprint/BP_Light.BP_Light）
