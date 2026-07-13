@@ -112,10 +112,11 @@ bool FBlueprintBusterModule::IsMacroExpanderAvailable() const
 
 FString FBlueprintBusterModule::GetMCPServerUrl() const
 {
+	
 	// Check environment variable
-	if (const TCHAR* MCPEnv = FPlatformMisc::GetEnvironmentVariable(TEXT("BB_MCP_SERVER")))
+	if (const FString MCPEnv = FPlatformMisc::GetEnvironmentVariable(TEXT("BB_MCP_SERVER")); !MCPEnv.IsEmpty())
 	{
-		return FString(MCPEnv);
+		return MCPEnv;
 	}
 
 	// Check config
